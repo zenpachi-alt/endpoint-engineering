@@ -16,7 +16,10 @@
     policy values are built under a test key in HKEY_CURRENT_USER\Software and
     removed afterwards. RSoP results, GPO cache entries and Preferences items
     are built here as the script's own readers return them. Registry.pol files
-    and Preferences history are written to TestDrive.
+    and Preferences history are written to TestDrive, and so are the ADMX and
+    ADML files the ADMX tests read, with an ingested copy in a folder and one
+    in the test registry. One test also reads this device's own
+    %windir%\PolicyDefinitions, the files the script reads on a device.
 
     The script is also run as a file, as a technician starts it: unelevated it
     must stop at the elevation check, and elevated, as in CI, it must finish.
@@ -116,9 +119,13 @@ Describe 'Get-PolicySource' -Skip:([Environment]::OSVersion.Platform -ne 'Win32N
         }
 
         function Invoke-Resolve {
-            param ([object[]]$Mdm = @(), [object[]]$Applied = @(), [object[]]$Cached = @(), [object[]]$Preference = @(), [bool]$MdmWinsOverGp = $true)
+            # Without an ADMX index, as in the tests written for 1.1, nothing is read from ADMX.
+            param (
+                [object[]]$Mdm = @(), [object[]]$Applied = @(), [object[]]$Cached = @(), [object[]]$Preference = @(), [bool]$MdmWinsOverGp = $true,
+                $AdmxIndex = $null
+            )
             # Whole, even with one row: Windows PowerShell 5.1 gives a lone object no Count.
-            , @(Resolve-PolicySource -Mdm $Mdm -GpApplied $Applied -GpCached $Cached -Preference $Preference -Root $script:Root -MdmWinsOverGp $MdmWinsOverGp)
+            , @(Resolve-PolicySource -Mdm $Mdm -GpApplied $Applied -GpCached $Cached -Preference $Preference -Root $script:Root -MdmWinsOverGp $MdmWinsOverGp -AdmxIndex $AdmxIndex)
         }
 
         function Get-TestRegistryPol {
@@ -730,6 +737,406 @@ Describe 'Get-PolicySource' -Skip:([Environment]::OSVersion.Platform -ne 'Win32N
         It 'gives nothing, not an empty row, when nothing matches' {
             @(Select-PolicySource -Row $script:Rows -Filter '*NoSuchSetting*').Count | Should -Be 0
             @(Select-PolicySource -Row @()).Count | Should -Be 0
+        }
+    }
+
+    Context 'ADMX definitions' {
+
+        BeforeAll {
+            $script:AdmxDirectory = Join-Path -Path $TestDrive -ChildPath 'PolicyDefinitions'
+            $script:IngestedDirectory = Join-Path -Path $TestDrive -ChildPath 'PolicyManagerTest'
+            $null = New-Item -Path (Join-Path -Path $script:AdmxDirectory -ChildPath 'en-US') -ItemType Directory -Force
+            $utf8 = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false
+            $header = '<?xml version="1.0" encoding="utf-8"?>' + "`r`n" +
+            '<policyDefinitions xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions" revision="1.0" schemaVersion="1.0">'
+
+            # A computer policy of each shape: explicit and implicit values, every element type,
+            # an enum item with a valueList, a list, enabled and disabled lists, and a user policy.
+            [IO.File]::WriteAllText((Join-Path -Path $script:AdmxDirectory -ChildPath 'Fixture.admx'), $header + @'
+  <policyNamespaces><target prefix="fixture" namespace="Test.Policies.Fixture" /></policyNamespaces>
+  <resources minRequiredRevision="1.0" />
+  <categories><category name="FixtureCategory" displayName="$(string.FixtureCategory)" /></categories>
+  <policies>
+    <policy name="Simple" class="Machine" displayName="$(string.Simple)" key="SOFTWARE\Policies\Fixture" valueName="Simple">
+      <parentCategory ref="FixtureCategory" />
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+    <policy name="Implicit" class="Machine" displayName="$(string.Implicit)" key="SOFTWARE\Policies\Fixture" valueName="Implicit">
+      <parentCategory ref="FixtureCategory" />
+    </policy>
+    <policy name="Layer" class="Machine" displayName="$(string.Layer)" key="SOFTWARE\Policies\Fixture\Remote">
+      <parentCategory ref="FixtureCategory" />
+      <elements>
+        <enum id="LayerChoice" valueName="SecurityLayer">
+          <item displayName="$(string.Rdp)"><value><decimal value="0" /></value></item>
+          <item displayName="$(string.Negotiate)"><value><decimal value="1" /></value></item>
+          <item displayName="$(string.Tls)">
+            <value><decimal value="2" /></value>
+            <valueList><item valueName="TlsOnly"><value><string>Yes</string></value></item></valueList>
+          </item>
+        </enum>
+        <decimal id="LevelNumber" valueName="Level" />
+        <boolean id="FlagSwitch" valueName="Flag" />
+        <text id="ServerName" key="SOFTWARE\Policies\Fixture\Remote\Server" valueName="Name" />
+        <multiText id="PathList" valueName="Paths" />
+      </elements>
+    </policy>
+    <policy name="Allow" class="Both" displayName="$(string.Allow)" key="SOFTWARE\Policies\Fixture\Allow">
+      <parentCategory ref="FixtureCategory" />
+      <elements><list id="AllowList" key="SOFTWARE\Policies\Fixture\Allow\List" explicitValue="true" /></elements>
+    </policy>
+    <policy name="Switches" class="Machine" displayName="$(string.Switches)" key="SOFTWARE\Policies\Fixture\Switches">
+      <parentCategory ref="FixtureCategory" />
+      <enabledList>
+        <item valueName="On"><value><decimal value="1" /></value></item>
+        <item valueName="Mode"><value><string>Strict</string></value></item>
+      </enabledList>
+      <disabledList><item valueName="On"><value><delete /></value></item></disabledList>
+    </policy>
+    <policy name="UserOnly" class="User" displayName="$(string.Simple)" key="SOFTWARE\Policies\Fixture" valueName="UserOnly">
+      <parentCategory ref="FixtureCategory" />
+    </policy>
+  </policies>
+</policyDefinitions>
+'@, $utf8)
+            [IO.File]::WriteAllText((Join-Path -Path $script:AdmxDirectory -ChildPath 'en-US\Fixture.adml'), @'
+<?xml version="1.0" encoding="utf-8"?>
+<policyDefinitionResources xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions" revision="1.0" schemaVersion="1.0">
+  <resources>
+    <stringTable>
+      <string id="Simple">Fixture simple switch</string>
+      <string id="Layer">Require a fixture security layer</string>
+      <string id="Allow">Allow fixture items</string>
+    </stringTable>
+  </resources>
+</policyDefinitionResources>
+'@, $utf8)
+            # A second policy under the same key, in a file without an ADML, and a file that is not XML.
+            [IO.File]::WriteAllText((Join-Path -Path $script:AdmxDirectory -ChildPath 'Second.admx'), $header + @'
+  <policyNamespaces><target prefix="second" namespace="Test.Policies.Second" /></policyNamespaces>
+  <policies>
+    <policy name="Other" class="Machine" displayName="$(string.Other)" key="SOFTWARE\Policies\Fixture\Remote" valueName="Other">
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+  </policies>
+</policyDefinitions>
+'@, $utf8)
+            [IO.File]::WriteAllText((Join-Path -Path $script:AdmxDirectory -ChildPath 'Broken.admx'), '<policyDefinitions><policies><policy name="Cut"', $utf8)
+
+            # An ingested copy as Windows might keep it: no extension, in a folder of its own,
+            # with its category path spread over two categories. A file beside it is not ADMX.
+            $folder = Join-Path -Path $script:IngestedDirectory -ChildPath ([guid]::NewGuid().ToString('n'))
+            $null = New-Item -Path $folder -ItemType Directory -Force
+            [IO.File]::WriteAllText((Join-Path -Path $folder -ChildPath ([guid]::NewGuid().ToString('n'))), $header + @'
+  <policyNamespaces><target prefix="vendorapp" namespace="Vendor.Policies.App" /></policyNamespaces>
+  <categories>
+    <category name="VendorApp" displayName="$(string.VendorApp)" />
+    <category name="VendorSync" displayName="$(string.VendorSync)"><parentCategory ref="VendorApp" /></category>
+  </categories>
+  <policies>
+    <policy name="SyncNow" class="Machine" displayName="$(string.SyncNow)" key="SOFTWARE\Policies\Vendor\App" valueName="SyncNow">
+      <parentCategory ref="VendorSync" />
+    </policy>
+  </policies>
+</policyDefinitions>
+'@, $utf8)
+            [IO.File]::WriteAllText((Join-Path -Path $folder -ChildPath 'notes.txt'), 'Not an ADMX file.', $utf8)
+
+            $script:IngestedInRegistry = $header + @'
+  <policyNamespaces><target prefix="othervendor" namespace="Other.Policies.Tool" /></policyNamespaces>
+  <categories><category name="OtherTool" displayName="$(string.OtherTool)" /></categories>
+  <policies>
+    <policy name="Remote" class="Machine" displayName="$(string.Remote)" key="SOFTWARE\Policies\Other\Tool" valueName="Remote">
+      <parentCategory ref="OtherTool" />
+    </policy>
+  </policies>
+</policyDefinitions>
+'@
+
+            function Get-TestIndex {
+                # The fixture files, with the ingested copy in the test registry under AdmxInstalled.
+                Write-TestValue -Path ('SOFTWARE\Microsoft\PolicyManager\AdmxInstalled\{0}\OtherTool\Policy\{1}' -f (Get-TestGuid), (Get-TestGuid)) -Value @{
+                    Data = $script:IngestedInRegistry
+                }
+                Import-AdmxDefinition -Directory $script:AdmxDirectory -IngestedDirectory @($script:IngestedDirectory) -Root $script:Root -Language @('de-DE', 'en-US')
+            }
+
+            function Get-TestAdmxPolicy {
+                # An ADMX-backed MDM setting, as Get-MdmPolicy returns it.
+                param ([string]$Name, [string]$Value = '<enabled/>', [string]$Key = '', [string]$ValueName = '', [hashtable]$Property = @{})
+                $settings = @{ Name = $Name; Value = $Value; AdmxBacked = $true; RedirectKey = $Key; RedirectValue = $ValueName }
+                foreach ($property in $Property.Keys) { $settings[$property] = $Property[$property] }
+                Get-TestPolicy -Property $settings
+            }
+
+            function Get-TestRow {
+                # The one row for a registry value under SOFTWARE\Policies.
+                param ([object[]]$Row, [string]$Path)
+                # Whole, as in Invoke-Resolve: Windows PowerShell 5.1 gives a lone object no Count.
+                , @($Row | Where-Object { $_.RegistryPath -eq "HKLM\SOFTWARE\Policies\$Path" })
+            }
+        }
+
+        It 'reads computer policies with their Group Policy names, leaves out user policies, and records a file it cannot read' {
+            $index = Get-TestIndex
+
+            $index.ByFile['fixture|simple'].DisplayName | Should -Be 'Fixture simple switch'
+            $index.ByFile['fixture|simple'].Label | Should -Be 'Fixture.admx: Simple'
+            $index.ByFile.ContainsKey('fixture|useronly') | Should -BeFalse
+            $index.ByFile['second|other'].DisplayName | Should -BeNullOrEmpty
+            $index.WithoutAdml | Should -Be 1
+            $index.Failed.ContainsKey('broken') | Should -BeTrue
+            $index.Files.ContainsKey('broken') | Should -BeFalse
+
+            $layer = $index.ByFile['fixture|layer']
+            @($layer.Footprint | ForEach-Object { '{0}\{1}' -f $_.Key, $_.ValueName } | Sort-Object) -join ',' |
+                Should -Be ('SOFTWARE\Policies\Fixture\Remote\Flag,SOFTWARE\Policies\Fixture\Remote\Level,SOFTWARE\Policies\Fixture\Remote\Paths,' +
+                    'SOFTWARE\Policies\Fixture\Remote\SecurityLayer,SOFTWARE\Policies\Fixture\Remote\Server\Name,SOFTWARE\Policies\Fixture\Remote\TlsOnly')
+            $index.ByListKey['software\policies\fixture\allow\list'][0].Name | Should -Be 'Allow'
+            @($index.ByValue['software\policies\fixture\remote|securitylayer']).Count | Should -Be 1
+        }
+
+        It 'finds ingested copies by their content, in a folder and in the registry, with their category path' {
+            $index = Get-TestIndex
+
+            $index.IngestedFrom['File'] | Should -Be 1
+            $index.IngestedFrom['Registry'] | Should -Be 1
+            $index.Ingested['vendorapp~vendorsync|syncnow'].Label | Should -Be 'ingested vendorapp: SyncNow'
+            $index.Ingested['othertool|remote'].Key | Should -Be 'SOFTWARE\Policies\Other\Tool'
+        }
+
+        It 'stops with a reason when there is no ADMX folder' {
+            { Import-AdmxDefinition -Directory (Join-Path -Path $TestDrive -ChildPath 'NoSuchFolder') } | Should -Throw '*no ADMX folder*'
+        }
+
+        It 'ties an MDM setting to its ADMX policy by file, ingested area, value or element ids' {
+            $index = Get-TestIndex
+            $cases = @(
+                , @((Get-TestAdmxPolicy -Name 'ADMX_Fixture/Layer'), 'File', 'Fixture.admx: Layer')
+                , @((Get-TestAdmxPolicy -Name 'VendorApp~Policy~VendorApp~VendorSync/SyncNow'), 'Ingested', 'ingested vendorapp: SyncNow')
+                , @((Get-TestAdmxPolicy -Name 'Fixture/SimpleSwitch' -Key 'SOFTWARE\Policies\Fixture' -ValueName 'Simple'), 'Value', 'Fixture.admx: Simple')
+                , @((Get-TestAdmxPolicy -Name 'Fixture/RemoteLayer' -Key 'SOFTWARE\Policies\Fixture\Remote' -Value '<enabled/><data id="LayerChoice" value="1"/>'), 'Key', 'Fixture.admx: Layer')
+                , @((Get-TestAdmxPolicy -Name 'ADMX_Gone/Other' -Key 'SOFTWARE\Policies\Fixture\Remote' -ValueName 'Other'), 'Value', 'Second.admx: Other')
+            )
+            foreach ($case in $cases) {
+                $found = Resolve-AdmxPolicy -Policy $case[0] -Index $index
+                $found.Kind | Should -Be $case[1] -Because $case[0].Name
+                $found.Definition.Label | Should -Be $case[2] -Because $case[0].Name
+            }
+        }
+
+        It 'does not guess: a key alone, a missing file, an unreadable file or a missing policy each give a reason' {
+            $index = Get-TestIndex
+            $cases = @(
+                , @((Get-TestAdmxPolicy -Name 'Fixture/RemoteLayer' -Key 'SOFTWARE\Policies\Fixture\Remote'), 'KeyOnly', '*names only its key*')
+                , @((Get-TestAdmxPolicy -Name 'ADMX_Missing/Thing'), 'NoFile', ('*Missing.admx is not in {0}*' -f $script:AdmxDirectory))
+                , @((Get-TestAdmxPolicy -Name 'ADMX_Broken/Cut'), 'Unreadable', '*Broken.admx could not be read*')
+                , @((Get-TestAdmxPolicy -Name 'ADMX_Fixture/NoSuchPolicy'), 'NoPolicy', '*Fixture.admx has no policy NoSuchPolicy*')
+                , @((Get-TestAdmxPolicy -Name 'VendorApp~Policy~VendorApp/Unknown'), 'NoIngested', '*ingested ADMX files found*')
+            )
+            foreach ($case in $cases) {
+                $found = Resolve-AdmxPolicy -Policy $case[0] -Index $index
+                $found.Definition | Should -BeNullOrEmpty -Because $case[0].Name
+                $found.Kind | Should -Be $case[1] -Because $case[0].Name
+                $found.Reason | Should -BeLike $case[2] -Because $case[0].Name
+            }
+        }
+
+        It 'translates an enabled state into the value each element writes' {
+            $index = Get-TestIndex
+            $state = '<enabled/><data id="LayerChoice" value="2"/><data id="LevelNumber" value="7"/><data id="FlagSwitch" value="true"/>' +
+            '<data id="ServerName" value="host.contoso.com"/><data id="PathList" value="C:\One&#xF000;C:\Two"/>'
+            $writes = (ConvertFrom-AdmxState -Definition $index.ByFile['fixture|layer'] -Value $state).Value
+
+            $writes['software\policies\fixture\remote|securitylayer'].Text | Should -Be '2'
+            $writes['software\policies\fixture\remote|tlsonly'].Text | Should -Be 'Yes'
+            $writes['software\policies\fixture\remote|level'].Text | Should -Be '7'
+            $writes['software\policies\fixture\remote|flag'].Text | Should -Be '1'
+            $writes['software\policies\fixture\remote\server|name'].Text | Should -Be 'host.contoso.com'
+            $writes['software\policies\fixture\remote|paths'].Text | Should -Be 'C:\One; C:\Two'
+
+            # Data the definition does not offer is left out rather than guessed.
+            $partial = (ConvertFrom-AdmxState -Definition $index.ByFile['fixture|layer'] -Value '<enabled/><data id="LayerChoice" value="9"/>').Value
+            $partial.Count | Should -Be 0
+        }
+
+        It 'translates enabled and disabled lists, list items, and the defaults Windows uses where the ADMX gives no value' {
+            $index = Get-TestIndex
+            $switches = $index.ByFile['fixture|switches']
+            $on = (ConvertFrom-AdmxState -Definition $switches -Value '<enabled/>').Value
+            $on['software\policies\fixture\switches|on'].Text | Should -Be '1'
+            $on['software\policies\fixture\switches|mode'].Text | Should -Be 'Strict'
+            (ConvertFrom-AdmxState -Definition $switches -Value '<disabled/>').Value['software\policies\fixture\switches|on'].Absent | Should -BeTrue
+
+            (ConvertFrom-AdmxState -Definition $index.ByFile['fixture|simple'] -Value '<disabled/>').Value['software\policies\fixture|simple'].Text | Should -Be '0'
+            $implicit = $index.ByFile['fixture|implicit']
+            (ConvertFrom-AdmxState -Definition $implicit -Value '<Enabled/>').Value['software\policies\fixture|implicit'].Text | Should -Be '1'
+            $off = (ConvertFrom-AdmxState -Definition $implicit -Value '<disabled/>').Value['software\policies\fixture|implicit']
+            Format-ExpectedValue -Expected $off | Should -Be '0 or not set'
+            Test-ExpectedValue -Expected $off -Value $null | Should -BeTrue
+            Test-ExpectedValue -Expected $off -Value '0' | Should -BeTrue
+            Test-ExpectedValue -Expected $off -Value '1' | Should -BeFalse
+
+            $layerOff = (ConvertFrom-AdmxState -Definition $index.ByFile['fixture|layer'] -Value '<disabled/>').Value
+            $layerOff['software\policies\fixture\remote|securitylayer'].Absent | Should -BeTrue
+            (ConvertFrom-AdmxState -Definition $index.ByFile['fixture|layer'] -Value '<enabled/><data id="FlagSwitch" value="false"/>').Value['software\policies\fixture\remote|flag'].Loose |
+                Should -BeTrue
+
+            $list = ConvertFrom-AdmxState -Definition $index.ByFile['fixture|allow'] -Value '<enabled/><Data id="AllowList" value="first&#xF000;one&#xF000;second&#xF000;two"/>'
+            $list.Value['software\policies\fixture\allow\list|first'].Text | Should -Be 'one'
+            $list.Value['software\policies\fixture\allow\list|second'].Text | Should -Be 'two'
+            $list.ListKey | Should -Be 'SOFTWARE\Policies\Fixture\Allow\List'
+
+            ConvertFrom-AdmxState -Definition $implicit -Value '1' | Should -BeNullOrEmpty
+            ConvertFrom-AdmxState -Definition $implicit -Value '<enabled/><data id="x" value="&"/>' | Should -BeNullOrEmpty
+        }
+
+        It 'Agree, matched through the ADMX definition, where 1.1 could only match by key' {
+            Write-TestValue -Path 'SOFTWARE\Policies\Fixture\Remote' -Value @{ SecurityLayer = 2 }
+            $mdm = @(Get-TestAdmxPolicy -Name 'ADMX_Fixture/Layer' -Key 'SOFTWARE\Policies\Fixture\Remote' -Value '<enabled/><data id="LayerChoice" value="2"/>')
+            $applied = @(Get-TestGpEntry -Key 'SOFTWARE\Policies\Fixture\Remote' -ValueName 'SecurityLayer' -Value '2')
+
+            $row = Get-TestRow -Row (Invoke-Resolve -Mdm $mdm -Applied $applied -AdmxIndex (Get-TestIndex)) -Path 'Fixture\Remote\SecurityLayer'
+            $row.Count | Should -Be 1
+            $row[0].Verdict | Should -Be 'Agree'
+            $row[0].Setting | Should -Be 'ADMX_Fixture/Layer'
+            $row[0].MatchedBy | Should -Be 'Admx'
+            $row[0].MdmValue | Should -Be 'Enabled: LayerChoice=2'
+            $row[0].MdmRegistryValue | Should -Be '2'
+            $row[0].AdmxPolicy | Should -Be 'Fixture.admx: Layer'
+            $row[0].PolicyDisplayName | Should -Be 'Require a fixture security layer'
+
+            # The same sources without ADMX definitions, as 1.1 saw them.
+            (Get-TestRow -Row (Invoke-Resolve -Mdm $mdm -Applied $applied) -Path 'Fixture\Remote\SecurityLayer')[0].Verdict | Should -Be 'GpOnly'
+        }
+
+        It 'Conflict where the value the ADMX state means differs from the GPO, saying whose value the registry holds' {
+            Write-TestValue -Path 'SOFTWARE\Policies\Fixture' -Value @{ Simple = 0 }
+            $mdm = @(Get-TestAdmxPolicy -Name 'Fixture/SimpleSwitch' -Key 'SOFTWARE\Policies\Fixture' -ValueName 'Simple')
+            $applied = @(Get-TestGpEntry -Key 'SOFTWARE\Policies\Fixture' -ValueName 'Simple' -Value '0')
+
+            $rows = Invoke-Resolve -MdmWinsOverGp $false -Mdm $mdm -Applied $applied -AdmxIndex (Get-TestIndex)
+            $rows.Count | Should -Be 1
+            $rows[0].Verdict | Should -Be 'Conflict'
+            $rows[0].MatchedBy | Should -Be 'Value'
+            $rows[0].MdmRegistryValue | Should -Be '1'
+            $rows[0].Note | Should -BeLike '*holds the value of Group Policy*MDMWinsOverGP is off*'
+
+            (Invoke-Resolve -MdmWinsOverGp $false -Mdm $mdm -Applied $applied)[0].Verdict | Should -Be 'Both'
+        }
+
+        It 'OverriddenByMdm compares the GPO value with the value the ADMX state means' {
+            $mdm = @(Get-TestAdmxPolicy -Name 'Fixture/SimpleSwitch' -Key 'SOFTWARE\Policies\Fixture' -ValueName 'Simple')
+            $rows = Invoke-Resolve -Mdm $mdm -Cached @(Get-TestGpEntry -Key 'SOFTWARE\Policies\Fixture' -ValueName 'Simple' -Value '1') -AdmxIndex (Get-TestIndex)
+
+            $rows[0].Verdict | Should -Be 'OverriddenByMdm'
+            $rows[0].Note | Should -BeLike '*both set the same value*'
+        }
+
+        It 'names the one ADMX setting behind each value under a shared key, and credits a value no definition writes to nobody' {
+            Write-TestValue -Path 'SOFTWARE\Policies\Fixture\Remote' -Value @{ SecurityLayer = 1; Other = 1; Stray = 5 }
+            $rows = Invoke-Resolve -AdmxIndex (Get-TestIndex) -Mdm @(
+                Get-TestAdmxPolicy -Name 'ADMX_Fixture/Layer' -Key 'SOFTWARE\Policies\Fixture\Remote' -Value '<enabled/><data id="LayerChoice" value="1"/>'
+                Get-TestAdmxPolicy -Name 'ADMX_Second/Other' -Key 'SOFTWARE\Policies\Fixture\Remote' -ValueName 'Other'
+            )
+
+            $layer = Get-TestRow -Row $rows -Path 'Fixture\Remote\SecurityLayer'
+            $layer[0].Verdict | Should -Be 'MdmOnly'
+            $layer[0].MdmSetting | Should -Be 'ADMX_Fixture/Layer'
+            $layer[0].MatchedBy | Should -Be 'Admx'
+            $layer[0].Note | Should -Be 'Matched through the ADMX definition of the MDM setting, which writes this value.'
+            (Get-TestRow -Row $rows -Path 'Fixture\Remote\Other')[0].MdmSetting | Should -Be 'ADMX_Second/Other'
+            $stray = Get-TestRow -Row $rows -Path 'Fixture\Remote\Stray'
+            $stray[0].Verdict | Should -Be 'Unclaimed'
+            $stray[0].MatchedBy | Should -BeNullOrEmpty
+            $stray[0].Note | Should -BeLike '*definitions do not include this value: ADMX_Fixture/Layer, ADMX_Second/Other.'
+            @($rows | Where-Object { -not $_.RegistryPath }).Count | Should -Be 0
+        }
+
+        It 'notes a registry value other than the one the ADMX state means, and a value it sets that is missing' {
+            Write-TestValue -Path 'SOFTWARE\Policies\Fixture' -Value @{ Simple = 0 }
+            Write-TestValue -Path 'SOFTWARE\Policies\Fixture\Remote' -Value @{ SecurityLayer = 2 }
+            $rows = Invoke-Resolve -AdmxIndex (Get-TestIndex) -Mdm @(
+                Get-TestAdmxPolicy -Name 'Fixture/SimpleSwitch' -Key 'SOFTWARE\Policies\Fixture' -ValueName 'Simple'
+                Get-TestAdmxPolicy -Name 'ADMX_Fixture/Layer' -Key 'SOFTWARE\Policies\Fixture\Remote' -Value '<enabled/><data id="LayerChoice" value="2"/><data id="LevelNumber" value="5"/>'
+            )
+
+            (Get-TestRow -Row $rows -Path 'Fixture\Simple')[0].Note | Should -BeLike '*different value from the one the MDM''s ADMX state means*'
+            (Get-TestRow -Row $rows -Path 'Fixture\Remote\SecurityLayer')[0].Note | Should -Not -BeLike '*different value*'
+            $missing = Get-TestRow -Row $rows -Path 'Fixture\Remote\Level'
+            $missing[0].Verdict | Should -Be 'MdmOnly'
+            $missing[0].LiveValue | Should -BeNullOrEmpty
+            $missing[0].MdmRegistryValue | Should -Be '5'
+            $missing[0].Note | Should -BeLike '*does not hold the value the MDM''s ADMX state means*'
+        }
+
+        It 'compares as 1.1 did when the ADMX definition is not found, and says why' {
+            $rows = Invoke-Resolve -AdmxIndex (Get-TestIndex) -Mdm @(
+                Get-TestAdmxPolicy -Name 'ADMX_Missing/Thing' -Key 'SOFTWARE\Policies\Missing' -ValueName 'Thing'
+            ) -Applied @(Get-TestGpEntry -Key 'SOFTWARE\Policies\Missing' -ValueName 'Thing' -Value '1')
+
+            $rows[0].Verdict | Should -Be 'Both'
+            $rows[0].MatchedBy | Should -Be 'Value'
+            $rows[0].MdmRegistryValue | Should -BeNullOrEmpty
+            $rows[0].Note | Should -BeLike '*ADMX state, not a value*Its ADMX definition was not found: Missing.admx is not in*'
+        }
+
+        It 'keeps the rows of an ADMX setting that writes several values apart when Group Policy sets one of them' {
+            Write-TestValue -Path 'SOFTWARE\Policies\Fixture\Remote' -Value @{ SecurityLayer = 1; Level = 3 }
+            $rows = Invoke-Resolve -AdmxIndex (Get-TestIndex) -Mdm @(
+                Get-TestAdmxPolicy -Name 'ADMX_Fixture/Layer' -Key 'SOFTWARE\Policies\Fixture\Remote' -Value '<enabled/><data id="LayerChoice" value="1"/><data id="LevelNumber" value="3"/>'
+            ) -Cached @(Get-TestGpEntry -Key 'SOFTWARE\Policies\Fixture\Remote' -ValueName 'SecurityLayer' -Value '1')
+
+            $rows.Count | Should -Be 2
+            (Get-TestRow -Row $rows -Path 'Fixture\Remote\SecurityLayer')[0].Verdict | Should -Be 'OverriddenByMdm'
+            (Get-TestRow -Row $rows -Path 'Fixture\Remote\Level')[0].Verdict | Should -Be 'MdmOnly'
+        }
+
+        It 'claims every item under an ADMX list, and an item the state leaves out is one it removes' {
+            Write-TestValue -Path 'SOFTWARE\Policies\Fixture\Allow\List' -Value @{ first = 'one'; extra = 'x' }
+            $rows = Invoke-Resolve -AdmxIndex (Get-TestIndex) -Mdm @(
+                Get-TestAdmxPolicy -Name 'ADMX_Fixture/Allow' -Key 'SOFTWARE\Policies\Fixture\Allow' -Value '<enabled/><data id="AllowList" value="first&#xF000;one"/>'
+            )
+
+            $first = Get-TestRow -Row $rows -Path 'Fixture\Allow\List\first'
+            $first[0].Setting | Should -Be 'ADMX_Fixture/Allow'
+            $first[0].MdmRegistryValue | Should -Be 'one'
+            $extra = Get-TestRow -Row $rows -Path 'Fixture\Allow\List\extra'
+            $extra[0].MatchedBy | Should -Be 'Admx'
+            $extra[0].MdmRegistryValue | Should -Be 'not set'
+        }
+
+        It 'names the Group Policy setting behind a value Group Policy alone sets, and filters by that name' {
+            Write-TestValue -Path 'SOFTWARE\Policies\Fixture' -Value @{ Simple = 1 }
+            $rows = Invoke-Resolve -AdmxIndex (Get-TestIndex) -Applied @(Get-TestGpEntry -Key 'SOFTWARE\Policies\Fixture' -ValueName 'Simple' -Value '1')
+
+            $row = Get-TestRow -Row $rows -Path 'Fixture\Simple'
+            $row[0].Verdict | Should -Be 'GpOnly'
+            $row[0].AdmxPolicy | Should -Be 'Fixture.admx: Simple'
+            $row[0].PolicyDisplayName | Should -Be 'Fixture simple switch'
+            @(Select-PolicySource -Row $rows -Filter '*simple switch*').Count | Should -Be 1
+        }
+
+        It 'adds the 1.2 columns after the 1.1 ones' {
+            $rows = Invoke-Resolve -AdmxIndex (Get-TestIndex) -Cached @(Get-TestGpEntry -Key 'Software\Policies\Test' -ValueName 'Level' -Value '1')
+            @($rows[0].PSObject.Properties.Name) -join ',' | Should -Be ('Verdict,Setting,LiveValue,GpValue,Gpo,OverriddenGpo,GpSource,MdmSetting,MdmValue,' +
+                'MdmSource,MdmSourceKind,MatchedBy,RegistryPath,Note,AdmxPolicy,PolicyDisplayName,MdmRegistryValue')
+        }
+
+        It 'reads the ADMX files of this device and translates a Remote Desktop state through them' {
+            $timer = [Diagnostics.Stopwatch]::StartNew()
+            $index = Import-AdmxDefinition -Directory (Join-Path -Path $env:windir -ChildPath 'PolicyDefinitions') -Language @('en-US')
+            $timer.Stop()
+
+            $index.Files.Count | Should -BeGreaterThan 100
+            $index.Failed.Count | Should -Be 0 -Because (@($index.Failed.Keys) -join ', ')
+            $found = Resolve-AdmxPolicy -Index $index -Policy (Get-TestAdmxPolicy -Name 'ADMX_TerminalServer/TS_SECURITY_LAYER_POLICY' -Key 'SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services')
+            $found.Kind | Should -Be 'File'
+            $writes = (ConvertFrom-AdmxState -Definition $found.Definition -Value '<enabled/><data id="TS_SECURITY_LAYER" value="2"/>').Value
+            $writes['software\policies\microsoft\windows nt\terminal services|securitylayer'].Text | Should -Be '2'
+            $timer.Elapsed.TotalSeconds | Should -BeLessThan 30
         }
     }
 
