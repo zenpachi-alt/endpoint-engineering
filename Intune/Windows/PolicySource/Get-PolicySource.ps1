@@ -28,6 +28,10 @@
                        holds that RSoP does not show was not applied.
         Preferences    The local history of Group Policy Preferences registry
                        items.
+        ADMX           The administrative templates in %windir%\PolicyDefinitions
+                       and the copies Windows keeps of ADMX files an MDM
+                       ingested: what each policy writes to the registry, and
+                       its name in Group Policy.
         Registry       The value Windows reads now.
 
     Nothing contacts a domain controller or the internet, so the script works
@@ -43,8 +47,9 @@
         NotApplied       A GPO sets it, it was not applied, and no Intune
                          setting explains why.
         Both             Both set it. Intune sends an ADMX state (Enabled,
-                         Disabled) rather than a value, so the GPO's value is
-                         compared with the one in the registry instead.
+                         Disabled) rather than a value, and its ADMX definition
+                         was not found, so the GPO's value is compared with the
+                         one in the registry instead.
         Agree            Both set it, to the same value.
         GpOnly           Group Policy only.
         MdmOnly          Intune, or another MDM, only.
@@ -58,9 +63,16 @@
                          sources claims: a script, an app, another management
                          tool, or a Windows default.
 
-    A value can be matched to an MDM setting by the value itself, or only by
-    its key, when an ADMX-backed setting writes several values under one key.
-    MatchedBy says which; a match by key is weaker evidence.
+    An ADMX-backed MDM setting sends a state, such as Enabled with data, not
+    the value the registry holds. Its ADMX definition says which registry
+    values that state writes, and what each one is: MdmRegistryValue. Those
+    values are compared with Group Policy's and the registry's like any other.
+
+    A value is matched to an MDM setting by the value itself, through the
+    setting's ADMX definition, or only by its key, when the setting's ADMX
+    definition was not found. MatchedBy says which (Value, Admx, Key); a match
+    by key is weaker evidence. A value under the key of an ADMX setting whose
+    definition does not write it is not credited to that setting.
 
     Settings Windows provisions for itself through PolicyManager - power and
     processor tuning, mostly, hundreds of them - are left out unless
@@ -68,7 +80,8 @@
 
 .PARAMETER Filter
     Only settings matching one of these wildcard patterns, tried against the
-    setting name, the registry path, the Intune setting and the GPO name.
+    setting name, the registry path, the Intune setting, the GPO name, the ADMX
+    policy and its name in Group Policy.
 
 .PARAMETER Verdict
     Only settings with one of these verdicts.
@@ -101,6 +114,13 @@
     explains the verdict.
 
 .EXAMPLE
+    .\Get-PolicySource.ps1 -Filter '*Terminal Services*' |
+        Format-Table -Property Verdict, PolicyDisplayName, GpValue, MdmRegistryValue, LiveValue -Wrap
+
+    Remote Desktop settings by their Group Policy names, with the value Group
+    Policy sets, the value Intune's ADMX state means, and the one in effect.
+
+.EXAMPLE
     .\Get-PolicySource.ps1 | Export-Csv -Path .\PolicySource.csv -NoTypeInformation
 
     Everything, as a file for the other team. It holds GPO names and policy
@@ -108,8 +128,8 @@
 
 .NOTES
     Author        : Tomasz Pietryka
-    Version       : 1.1.0
-    Last updated  : 2026-10-07
+    Version       : 1.2.0
+    Last updated  : 2026-10-18
 
     PowerShell    : Windows PowerShell 5.1. It runs on the device, where
                     PowerShell 7 cannot be assumed.
@@ -131,12 +151,13 @@
     Limits        : Computer settings only, not user settings. Registry-based
                     policy only: security settings (passwords, user rights,
                     audit) go through a separate engine and are not read.
-                    An ADMX state is not translated into the value it means;
-                    the GPO's value is compared with the registry instead. A
-                    value matched by key names every ADMX setting that writes
-                    under the key, not the one that wrote it. A setting
-                    written by a script or an app is Unclaimed only under
-                    HKLM\SOFTWARE\Policies.
+                    ADMX states are translated with the ADMX files on the
+                    device, not the central store, which needs a domain
+                    controller. An ADMX setting whose definition is not found
+                    is compared and matched by key as before, and a value
+                    matched by key names every such setting that writes under
+                    the key. A setting written by a script or an app is
+                    Unclaimed only under HKLM\SOFTWARE\Policies.
 
 .LINK
     https://learn.microsoft.com/windows/client-management/mdm/policy-csp-controlpolicyconflict
@@ -176,6 +197,7 @@ $PolicyManagerPath = 'SOFTWARE\Microsoft\PolicyManager'
 $PoliciesPath = 'SOFTWARE\Policies'
 $GpoCacheDirectory = Join-Path -Path $env:windir -ChildPath 'System32\GroupPolicy\DataStore'
 $PreferencesHistoryDirectory = Join-Path -Path $env:ProgramData -ChildPath 'Microsoft\Group Policy\History'
+$PolicyDefinitionsDirectory = Join-Path -Path $env:windir -ChildPath 'PolicyDefinitions'
 
 # Verdicts in the order they are listed: the ones that need a decision first.
 $VerdictRank = @{
@@ -727,6 +749,836 @@ function Get-MdmPolicy {
     }
 }
 
+function ConvertFrom-AdmxValue {
+    <#
+        .SYNOPSIS
+            The registry data one ADMX value element holds - <decimal>,
+            <longDecimal>, <string> or <delete> inside enabledValue, trueValue,
+            an item's <value> and the like - as the text ConvertTo-ValueText
+            gives for the value in the registry. $null when there is none.
+
+            A negative number is shown unsigned, as the registry reader shows
+            it; a number that does not parse is kept as written, so one odd
+            value cannot cost a whole file.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param (
+        [Parameter(Mandatory)]
+        [System.Xml.XmlNode]$Node
+    )
+
+    foreach ($child in $Node.ChildNodes) {
+        if ($child -isnot [System.Xml.XmlElement]) { continue }
+        $kind = $child.LocalName
+        if ($kind -eq 'delete') { return [pscustomobject]@{ Text = $null; Absent = $true; Loose = $false } }
+        if ($kind -eq 'decimal' -or $kind -eq 'longDecimal') {
+            $text = $child.GetAttribute('value')
+            $long = [long]0
+            if ([long]::TryParse($text, [Globalization.NumberStyles]::Integer, [cultureinfo]::InvariantCulture, [ref]$long)) {
+                $text = if ($kind -eq 'decimal') { [string][BitConverter]::ToUInt32([BitConverter]::GetBytes($long), 0) }
+                else { [string][BitConverter]::ToUInt64([BitConverter]::GetBytes($long), 0) }
+            }
+        }
+        elseif ($kind -eq 'string') { $text = $child.InnerText }
+        else { continue }
+        return [pscustomobject]@{ Text = $text; Absent = $false; Loose = $false }
+    }
+}
+
+function ConvertFrom-AdmxList {
+    <#
+        .SYNOPSIS
+            The items of an ADMX enabledList, disabledList, trueList, falseList or
+            valueList: the registry values the list writes, each with its data.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param (
+        [Parameter(Mandatory)]
+        [System.Xml.XmlElement]$Node,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Key
+    )
+
+    $listKey = $Node.GetAttribute('defaultKey')
+    if (-not $listKey) { $listKey = $Key }
+    foreach ($item in $Node.ChildNodes) {
+        if ($item -isnot [System.Xml.XmlElement] -or $item.LocalName -ne 'item') { continue }
+        $itemKey = $item.GetAttribute('key')
+        if (-not $itemKey) { $itemKey = $listKey }
+        $data = $null
+        foreach ($value in $item.ChildNodes) {
+            if ($value -is [System.Xml.XmlElement] -and $value.LocalName -eq 'value') { $data = ConvertFrom-AdmxValue -Node $value }
+        }
+        if ($null -eq $data) { continue }
+        [pscustomobject]@{ Key = $itemKey; ValueName = $item.GetAttribute('valueName'); Value = $data }
+    }
+}
+
+function Read-AdmxDocument {
+    <#
+        .SYNOPSIS
+            The computer policies one ADMX document defines, with what each one
+            writes to the registry, and its categories.
+
+        .DESCRIPTION
+            User policies are left out: only computer settings are compared.
+            Each policy gets a footprint - every registry value it can write, in
+            any state - and the keys its list elements fill, so a value in the
+            registry can be traced to the one policy that writes it.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param (
+        [Parameter(Mandatory)]
+        [System.Xml.XmlDocument]$Document,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Source,
+
+        [Parameter()]
+        [AllowNull()]
+        [hashtable]$String
+    )
+
+    $root = $Document.DocumentElement
+    if ($null -eq $root -or $root.LocalName -ne 'policyDefinitions') { throw 'it is not an ADMX file: the root element is not policyDefinitions' }
+
+    $prefix = $null
+    $categories = @{}
+    $policies = [System.Collections.Generic.List[object]]::new()
+    foreach ($section in $root.ChildNodes) {
+        if ($section -isnot [System.Xml.XmlElement]) { continue }
+
+        if ($section.LocalName -eq 'policyNamespaces') {
+            foreach ($target in $section.ChildNodes) {
+                if ($target -is [System.Xml.XmlElement] -and $target.LocalName -eq 'target') { $prefix = $target.GetAttribute('prefix') }
+            }
+        }
+        elseif ($section.LocalName -eq 'categories') {
+            foreach ($category in $section.ChildNodes) {
+                if ($category -isnot [System.Xml.XmlElement] -or $category.LocalName -ne 'category') { continue }
+                $parent = $null
+                foreach ($link in $category.ChildNodes) {
+                    if ($link -is [System.Xml.XmlElement] -and $link.LocalName -eq 'parentCategory') { $parent = ($link.GetAttribute('ref') -split ':')[-1] }
+                }
+                $categories[$category.GetAttribute('name')] = $parent
+            }
+        }
+        elseif ($section.LocalName -eq 'policies') {
+            foreach ($node in $section.ChildNodes) {
+                if ($node -isnot [System.Xml.XmlElement] -or $node.LocalName -ne 'policy' -or $node.GetAttribute('class') -eq 'User') { continue }
+
+                $name = $node.GetAttribute('name')
+                $key = $node.GetAttribute('key')
+                $valueName = $node.GetAttribute('valueName')
+                $footprint = [System.Collections.Generic.List[object]]::new()
+                $listKeys = [System.Collections.Generic.List[string]]::new()
+                if ($valueName) { $footprint.Add([pscustomobject]@{ Key = $key; ValueName = $valueName }) }
+
+                # Keys are set with brackets: an ordered dictionary has properties of its own,
+                # such as Item and Count, that a dotted name would reach instead.
+                $policy = [ordered]@{
+                    Source = $Source; Name = $name; Key = $key; ValueName = $valueName; Category = $null
+                    EnabledValue = $null; DisabledValue = $null; EnabledList = @(); DisabledList = @()
+                    Elements = [System.Collections.Generic.List[object]]::new()
+                }
+                foreach ($part in $node.ChildNodes) {
+                    if ($part -isnot [System.Xml.XmlElement]) { continue }
+                    switch ($part.LocalName) {
+                        'parentCategory' { $policy['Category'] = ($part.GetAttribute('ref') -split ':')[-1] }
+                        'enabledValue' { $policy['EnabledValue'] = ConvertFrom-AdmxValue -Node $part }
+                        'disabledValue' { $policy['DisabledValue'] = ConvertFrom-AdmxValue -Node $part }
+                        'enabledList' { $policy['EnabledList'] = @(ConvertFrom-AdmxList -Node $part -Key $key) }
+                        'disabledList' { $policy['DisabledList'] = @(ConvertFrom-AdmxList -Node $part -Key $key) }
+                        'elements' {
+                            foreach ($element in $part.ChildNodes) {
+                                if ($element -isnot [System.Xml.XmlElement]) { continue }
+                                $elementKey = $element.GetAttribute('key')
+                                if (-not $elementKey) { $elementKey = $key }
+                                $entry = [ordered]@{
+                                    Type = $element.LocalName; Id = $element.GetAttribute('id'); Key = $elementKey
+                                    ValueName = $element.GetAttribute('valueName')
+                                    TrueValue = $null; FalseValue = $null; TrueList = @(); FalseList = @(); Choice = @()
+                                }
+                                foreach ($child in $element.ChildNodes) {
+                                    if ($child -isnot [System.Xml.XmlElement]) { continue }
+                                    switch ($child.LocalName) {
+                                        'trueValue' { $entry['TrueValue'] = ConvertFrom-AdmxValue -Node $child }
+                                        'falseValue' { $entry['FalseValue'] = ConvertFrom-AdmxValue -Node $child }
+                                        'trueList' { $entry['TrueList'] = @(ConvertFrom-AdmxList -Node $child -Key $elementKey) }
+                                        'falseList' { $entry['FalseList'] = @(ConvertFrom-AdmxList -Node $child -Key $elementKey) }
+                                        'item' {
+                                            $data = $null
+                                            $extra = @()
+                                            foreach ($inner in $child.ChildNodes) {
+                                                if ($inner -isnot [System.Xml.XmlElement]) { continue }
+                                                if ($inner.LocalName -eq 'value') { $data = ConvertFrom-AdmxValue -Node $inner }
+                                                elseif ($inner.LocalName -eq 'valueList') { $extra = @(ConvertFrom-AdmxList -Node $inner -Key $elementKey) }
+                                            }
+                                            $entry['Choice'] += , [pscustomobject]@{ Value = $data; ValueList = $extra }
+                                            foreach ($write in $extra) { $footprint.Add($write) }
+                                        }
+                                    }
+                                }
+                                if ($entry['Type'] -eq 'list') { $listKeys.Add($elementKey) }
+                                elseif ($entry['ValueName']) { $footprint.Add([pscustomobject]@{ Key = $elementKey; ValueName = $entry['ValueName'] }) }
+                                foreach ($write in @($entry['TrueList']) + @($entry['FalseList'])) { $footprint.Add($write) }
+                                $policy['Elements'].Add([pscustomobject]$entry)
+                            }
+                        }
+                    }
+                }
+                foreach ($write in @($policy['EnabledList']) + @($policy['DisabledList'])) { $footprint.Add($write) }
+
+                $displayName = $null
+                if ($null -ne $String -and $node.GetAttribute('displayName') -match '^\$\(string\.(.+)\)$' -and $String.ContainsKey($Matches[1])) {
+                    $displayName = $String[$Matches[1]]
+                }
+                $policy['Label'] = '{0}: {1}' -f $Source, $name
+                $policy['DisplayName'] = $displayName
+                $policy['Footprint'] = $footprint.ToArray()
+                $policy['ListKeys'] = $listKeys.ToArray()
+                $policy['CategoryPath'] = $null
+                $policies.Add([pscustomobject]$policy)
+            }
+        }
+    }
+
+    return [pscustomobject]@{ Prefix = $prefix; Category = $categories; Policy = $policies.ToArray() }
+}
+
+function Read-AdmlString {
+    <#
+        .SYNOPSIS
+            The string table of one ADML file: string id to text.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param (
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path
+    )
+
+    $xml = New-Object -TypeName System.Xml.XmlDocument
+    $xml.Load($Path)
+    $strings = @{}
+    foreach ($node in $xml.SelectNodes("//*[local-name()='stringTable']/*[local-name()='string']")) {
+        $strings[$node.GetAttribute('id')] = $node.InnerText
+    }
+    return $strings
+}
+
+function Test-AdmxText {
+    <#
+        .SYNOPSIS
+            True when the start of a file or a registry string looks like an
+            ADMX document, whatever its name and encoding.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param (
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Text
+    )
+
+    return $Text.Contains('<policyDefinitions')
+}
+
+function Get-IngestedAdmxDocument {
+    <#
+        .SYNOPSIS
+            The copies Windows keeps of ADMX files an MDM ingested through
+            ADMXInstall, from the given folders and from PolicyManager's
+            AdmxInstalled key.
+
+        .DESCRIPTION
+            Microsoft documents that an ingested file is kept on disk but not
+            where, so a file counts by its content, not its name or extension.
+            Folders that cannot be read are logged and skipped.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param (
+        [Parameter()]
+        [AllowEmptyCollection()]
+        [string[]]$Directory = @(),
+
+        [Parameter()]
+        [AllowNull()]
+        [Microsoft.Win32.RegistryKey]$Root,
+
+        [Parameter()]
+        [ValidateRange(1, 100000)]
+        [int]$MaxFiles = 5000
+    )
+
+    $seen = 0
+    foreach ($start in $Directory) {
+        if (-not [IO.Directory]::Exists($start)) { continue }
+        $pending = [System.Collections.Generic.Stack[string]]::new()
+        $pending.Push($start)
+        while ($pending.Count -gt 0) {
+            $folder = $pending.Pop()
+            try {
+                foreach ($sub in [IO.Directory]::GetDirectories($folder)) { $pending.Push($sub) }
+                $files = [IO.Directory]::GetFiles($folder)
+            }
+            catch {
+                Write-LogEntry -Message "Ingested ADMX: could not list a folder under $start ($($_.Exception.GetType().Name)); it is skipped." -Level WARN
+                continue
+            }
+            foreach ($file in $files) {
+                if (++$seen -gt $MaxFiles) {
+                    Write-LogEntry -Message "Ingested ADMX: stopped after $MaxFiles files under $start." -Level WARN
+                    return
+                }
+                try {
+                    $stream = [IO.File]::OpenRead($file)
+                    try {
+                        $head = New-Object -TypeName byte[] -ArgumentList 2048
+                        $read = $stream.Read($head, 0, $head.Length)
+                    }
+                    finally {
+                        $stream.Dispose()
+                    }
+                    $text = [Text.Encoding]::UTF8.GetString($head, 0, $read)
+                    if (-not (Test-AdmxText -Text $text) -and -not (Test-AdmxText -Text ([Text.Encoding]::Unicode.GetString($head, 0, $read)))) { continue }
+                    $xml = New-Object -TypeName System.Xml.XmlDocument
+                    $xml.Load($file)
+                    [pscustomobject]@{ Document = $xml; Origin = 'File' }
+                }
+                catch {
+                    Write-LogEntry -Message "Ingested ADMX: a file under $start could not be read ($($_.Exception.GetType().Name)); it is skipped." -Level WARN
+                }
+            }
+        }
+    }
+
+    if ($null -eq $Root) { return }
+    foreach ($value in @(Get-RegistryValueLocation -Root $Root -Path "$PolicyManagerPath\AdmxInstalled" -MaxKeys 5000)) {
+        try {
+            $key = $Root.OpenSubKey($value.Key)
+            if ($null -eq $key) { continue }
+            try {
+                $data = $key.GetValue($value.ValueName)
+            }
+            finally {
+                $key.Dispose()
+            }
+            if ($data -isnot [string] -or -not (Test-AdmxText -Text $data)) { continue }
+            $xml = New-Object -TypeName System.Xml.XmlDocument
+            $xml.LoadXml($data)
+            [pscustomobject]@{ Document = $xml; Origin = 'Registry' }
+        }
+        catch {
+            Write-LogEntry -Message "Ingested ADMX: a value under AdmxInstalled could not be read ($($_.Exception.GetType().Name)); it is skipped." -Level WARN
+        }
+    }
+}
+
+function Import-AdmxDefinition {
+    <#
+        .SYNOPSIS
+            Every computer policy in the ADMX files on this device, indexed by
+            file, by ingested area, by the registry values each one writes, and
+            by key.
+
+        .DESCRIPTION
+            Built-in files come from Directory, with display names from the ADML
+            of the first of Language that has one. Ingested files come from
+            Get-IngestedAdmxDocument; they carry no ADML.
+
+            A built-in file that cannot be read is recorded under Failed with
+            the reason, so each setting it defines can say why it is compared
+            the way it is. The run itself does not fail over one file.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param (
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Directory,
+
+        [Parameter()]
+        [AllowEmptyCollection()]
+        [string[]]$IngestedDirectory = @(),
+
+        [Parameter()]
+        [AllowNull()]
+        [Microsoft.Win32.RegistryKey]$Root,
+
+        [Parameter()]
+        [AllowEmptyCollection()]
+        [string[]]$Language = @('en-US')
+    )
+
+    if (-not [IO.Directory]::Exists($Directory)) { throw "there is no ADMX folder at $Directory" }
+
+    $index = [pscustomobject]@{
+        Directory    = $Directory
+        Files        = @{}
+        Failed       = @{}
+        ByFile       = @{}
+        Ingested     = @{}
+        IngestedName = @{}
+        ByValue      = @{}
+        ByListKey    = @{}
+        ByKey        = @{}
+        WithoutAdml  = 0
+        IngestedFrom = @{ File = 0; Registry = 0 }
+    }
+    $all = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($path in [IO.Directory]::GetFiles($Directory, '*.admx')) {
+        $base = [IO.Path]::GetFileNameWithoutExtension($path)
+        $file = [IO.Path]::GetFileName($path)
+        # An ADML only names the policies, so one that cannot be read costs the names, not the file.
+        $strings = $null
+        foreach ($culture in $Language) {
+            $adml = [IO.Path]::Combine($Directory, $culture, "$base.adml")
+            if (-not [IO.File]::Exists($adml)) { continue }
+            try {
+                $strings = Read-AdmlString -Path $adml
+            }
+            catch {
+                Write-LogEntry -Message "ADMX definitions: $culture\$base.adml could not be read: $($_.Exception.Message)" -Level WARN
+            }
+            break
+        }
+        try {
+            $xml = New-Object -TypeName System.Xml.XmlDocument
+            $xml.Load($path)
+            $document = Read-AdmxDocument -Document $xml -Source $file -String $strings
+        }
+        catch {
+            $index.Failed[$base.ToLowerInvariant()] = $_.Exception.Message
+            continue
+        }
+        if ($null -eq $strings) { $index.WithoutAdml++ }
+        $index.Files[$base.ToLowerInvariant()] = $true
+        foreach ($policy in $document.Policy) {
+            $index.ByFile[('{0}|{1}' -f $base, $policy.Name).ToLowerInvariant()] = $policy
+            $all.Add($policy)
+        }
+    }
+
+    # Ingested files are found by area: <App>~<SettingType>~<category path>. The path
+    # runs from the top category down, by name, and may cross into another ingested file.
+    $ingested = @(Get-IngestedAdmxDocument -Directory $IngestedDirectory -Root $Root)
+    $documents = [System.Collections.Generic.List[object]]::new()
+    $categories = @{}
+    foreach ($copy in $ingested) {
+        try {
+            $label = 'ingested ADMX'
+            $target = $copy.Document.SelectSingleNode("/*[local-name()='policyDefinitions']/*[local-name()='policyNamespaces']/*[local-name()='target']")
+            if ($null -ne $target -and $target.GetAttribute('prefix')) { $label = 'ingested {0}' -f $target.GetAttribute('prefix') }
+            $document = Read-AdmxDocument -Document $copy.Document -Source $label
+        }
+        catch {
+            Write-LogEntry -Message "Ingested ADMX: a document could not be read: $($_.Exception.Message)" -Level WARN
+            continue
+        }
+        $index.IngestedFrom[$copy.Origin]++
+        $documents.Add($document)
+        foreach ($name in @($document.Category.Keys)) {
+            if (-not $categories.ContainsKey($name)) { $categories[$name] = $document.Category[$name] }
+        }
+    }
+    foreach ($document in $documents) {
+        foreach ($policy in $document.Policy) {
+            $path = [System.Collections.Generic.List[string]]::new()
+            $category = $policy.Category
+            while ($category -and $path.Count -lt 32 -and -not $path.Contains($category)) {
+                $path.Insert(0, $category)
+                $category = if ($document.Category.ContainsKey($category)) { $document.Category[$category] }
+                elseif ($categories.ContainsKey($category)) { $categories[$category] }
+                else { $null }
+            }
+            $policy.CategoryPath = $path -join '~'
+            $index.Ingested[('{0}|{1}' -f $policy.CategoryPath, $policy.Name).ToLowerInvariant()] = $policy
+            $name = $policy.Name.ToLowerInvariant()
+            if (-not $index.IngestedName.ContainsKey($name)) { $index.IngestedName[$name] = [System.Collections.Generic.List[object]]::new() }
+            $index.IngestedName[$name].Add($policy)
+            $all.Add($policy)
+        }
+    }
+
+    # A script block rather than a function: it runs thousands of times, and an advanced
+    # function call costs far more in Windows PowerShell 5.1. Keys are lowercased the way
+    # Get-LocationId and Get-KeyPath give them.
+    $add = {
+        param ([hashtable]$Table, [string]$Name, $Policy)
+        if (-not $Table.ContainsKey($Name)) { $Table[$Name] = [System.Collections.Generic.List[object]]::new() }
+        if (-not $Table[$Name].Contains($Policy)) { $Table[$Name].Add($Policy) }
+    }
+    foreach ($policy in $all) {
+        foreach ($write in $policy.Footprint) {
+            $id = ('{0}|{1}' -f $write.Key.Trim('\'), $write.ValueName).ToLowerInvariant()
+            & $add $index.ByValue $id $policy
+        }
+        foreach ($listKey in $policy.ListKeys) { & $add $index.ByListKey $listKey.Trim('\').ToLowerInvariant() $policy }
+        & $add $index.ByKey $policy.Key.Trim('\').ToLowerInvariant() $policy
+    }
+
+    return $index
+}
+
+function Get-AdmxStateData {
+    <#
+        .SYNOPSIS
+            An MDM ADMX state taken apart: enabled or disabled, and the value of
+            each <data> element by its id, lowercased. $null when the value is
+            not an ADMX state or is not well-formed.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param (
+        [Parameter(Mandatory)]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Value
+    )
+
+    if (-not (Test-AdmxState -Value $Value)) { return $null }
+
+    # Wrapped in one element, the state reads as XML, which also decodes &#xF000; and &amp;.
+    $xml = New-Object -TypeName System.Xml.XmlDocument
+    try {
+        $xml.LoadXml("<state>$Value</state>")
+    }
+    catch {
+        return $null
+    }
+
+    $state = $null
+    $data = @{}
+    foreach ($node in $xml.DocumentElement.ChildNodes) {
+        if ($node -isnot [System.Xml.XmlElement]) { continue }
+        $kind = $node.LocalName.ToLowerInvariant()
+        if ($kind -eq 'enabled' -or $kind -eq 'disabled') {
+            if (-not $state) { $state = $kind }
+        }
+        elseif ($kind -eq 'data') {
+            # Attribute names are matched in any case: Microsoft's own examples use both.
+            $id = $null; $text = ''
+            foreach ($attribute in $node.Attributes) {
+                if ($attribute.LocalName -eq 'id') { $id = $attribute.Value }
+                elseif ($attribute.LocalName -eq 'value') { $text = $attribute.Value }
+            }
+            if ($id) { $data[$id.ToLowerInvariant()] = $text }
+        }
+    }
+    if (-not $state) { return $null }
+
+    return [pscustomobject]@{ State = $state; Data = $data }
+}
+
+function ConvertFrom-AdmxState {
+    <#
+        .SYNOPSIS
+            The registry values an MDM ADMX state stands for, worked out from
+            the ADMX definition of its policy.
+
+        .DESCRIPTION
+            Enabled writes the policy's enabledValue - 1 where the ADMX gives
+            none - and its enabledList, then each element from its data: a
+            decimal as the number, a boolean as its trueValue or falseValue, an
+            enum as the item whose value the data names with that item's
+            valueList, text as it is, multiText split on U+F000, and a list as
+            name/value pairs split on U+F000. Disabled removes the element
+            values, then writes disabledValue and the disabledList.
+
+            Where the ADMX gives no disabledValue or falseValue, Windows may
+            write 0 or remove the value, so either counts as the state's value
+            (Loose). An element the state gives no data for, or data the
+            definition does not offer, is left out rather than guessed.
+
+            Returns Value - location id to the expected value - and ListKey, the
+            keys of the list elements the state fills or empties, or $null when
+            the value is not an ADMX state.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param (
+        [Parameter(Mandatory)]
+        [pscustomobject]$Definition,
+
+        [Parameter(Mandatory)]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Value
+    )
+
+    $parsed = Get-AdmxStateData -Value $Value
+    if ($null -eq $parsed) { return $null }
+
+    $one = [pscustomobject]@{ Text = '1'; Absent = $false; Loose = $false }
+    $zero = [pscustomobject]@{ Text = '0'; Absent = $false; Loose = $true }
+    $gone = [pscustomobject]@{ Text = $null; Absent = $true; Loose = $false }
+    $writes = @{}
+    $listKeys = [System.Collections.Generic.List[string]]::new()
+    $set = {
+        param ([string]$Key, [string]$Name, $Data)
+        $writes[('{0}|{1}' -f $Key.Trim('\'), $Name).ToLowerInvariant()] = [pscustomobject]@{
+            Key = $Key; ValueName = $Name; Text = $Data.Text; Absent = $Data.Absent; Loose = $Data.Loose
+        }
+    }
+    $text = {
+        param ([string]$Data)
+        [pscustomobject]@{ Text = $Data; Absent = $false; Loose = $false }
+    }
+
+    if ($parsed.State -eq 'enabled') {
+        if ($Definition.ValueName) {
+            & $set $Definition.Key $Definition.ValueName $(if ($null -ne $Definition.EnabledValue) { $Definition.EnabledValue } else { $one })
+        }
+        foreach ($write in $Definition.EnabledList) { & $set $write.Key $write.ValueName $write.Value }
+
+        foreach ($element in $Definition.Elements) {
+            $id = ([string]$element.Id).ToLowerInvariant()
+            if (-not $parsed.Data.ContainsKey($id)) { continue }
+            $data = [string]$parsed.Data[$id]
+            switch ($element.Type) {
+                'decimal' {
+                    $number = [uint32]0
+                    if ([uint32]::TryParse($data, [ref]$number)) { & $set $element.Key $element.ValueName (& $text ([string]$number)) }
+                }
+                'longDecimal' {
+                    $number = [uint64]0
+                    if ([uint64]::TryParse($data, [ref]$number)) { & $set $element.Key $element.ValueName (& $text ([string]$number)) }
+                }
+                'text' { & $set $element.Key $element.ValueName (& $text $data) }
+                'multiText' {
+                    $items = @($data.Split([char]0xF000) | Where-Object { $_ -ne '' })
+                    & $set $element.Key $element.ValueName (& $text ($items -join '; '))
+                }
+                'boolean' {
+                    if ($data -eq 'true' -or $data -eq '1') {
+                        if ($element.ValueName) { & $set $element.Key $element.ValueName $(if ($null -ne $element.TrueValue) { $element.TrueValue } else { $one }) }
+                        foreach ($write in $element.TrueList) { & $set $write.Key $write.ValueName $write.Value }
+                    }
+                    elseif ($data -eq 'false' -or $data -eq '0') {
+                        if ($element.ValueName) { & $set $element.Key $element.ValueName $(if ($null -ne $element.FalseValue) { $element.FalseValue } else { $zero }) }
+                        foreach ($write in $element.FalseList) { & $set $write.Key $write.ValueName $write.Value }
+                    }
+                }
+                'enum' {
+                    foreach ($choice in $element.Choice) {
+                        if ($null -eq $choice.Value -or $choice.Value.Text -ne $data) { continue }
+                        if ($element.ValueName) { & $set $element.Key $element.ValueName $choice.Value }
+                        foreach ($write in $choice.ValueList) { & $set $write.Key $write.ValueName $write.Value }
+                        break
+                    }
+                }
+                'list' {
+                    $parts = $data.Split([char]0xF000)
+                    if ($data -and $parts.Count % 2 -eq 0) {
+                        for ($at = 0; $at -lt $parts.Count; $at += 2) {
+                            if ($parts[$at]) { & $set $element.Key $parts[$at] (& $text $parts[$at + 1]) }
+                        }
+                        $listKeys.Add($element.Key)
+                    }
+                }
+            }
+        }
+    }
+    else {
+        foreach ($element in $Definition.Elements) {
+            if ($element.Type -eq 'list') { $listKeys.Add($element.Key) }
+            elseif ($element.ValueName) { & $set $element.Key $element.ValueName $gone }
+        }
+        if ($Definition.ValueName) {
+            & $set $Definition.Key $Definition.ValueName $(if ($null -ne $Definition.DisabledValue) { $Definition.DisabledValue } else { $zero })
+        }
+        foreach ($write in $Definition.DisabledList) { & $set $write.Key $write.ValueName $write.Value }
+    }
+
+    return [pscustomobject]@{ Value = $writes; ListKey = $listKeys.ToArray() }
+}
+
+function Test-ExpectedValue {
+    <#
+        .SYNOPSIS
+            True when Value - registry text, or $null for no value - is what an
+            MDM ADMX state means at that registry value.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param (
+        [Parameter(Mandatory)]
+        [pscustomobject]$Expected,
+
+        [Parameter(Mandatory)]
+        [AllowNull()]
+        [AllowEmptyString()]
+        $Value
+    )
+
+    if ($Expected.Absent) { return ($null -eq $Value) }
+    if ($Expected.Loose -and $null -eq $Value) { return $true }
+    return ($null -ne $Value -and [string]$Value -eq $Expected.Text)
+}
+
+function Format-ExpectedValue {
+    <#
+        .SYNOPSIS
+            The value an MDM ADMX state means at one registry value, for display.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param (
+        [Parameter(Mandatory)]
+        [pscustomobject]$Expected
+    )
+
+    if ($Expected.Absent) { return 'not set' }
+    if ($Expected.Loose) { return ('{0} or not set' -f $Expected.Text) }
+    return $Expected.Text
+}
+
+function Resolve-AdmxPolicy {
+    <#
+        .SYNOPSIS
+            The ADMX policy behind one ADMX-backed MDM setting, how it was
+            found, or why it was not.
+
+        .DESCRIPTION
+            In order: an ADMX_<File> area names its file; an ingested area,
+            <App>~<SettingType>~<category path>, names the category path; and
+            any setting can be found by the registry value PolicyManager maps it
+            to. A setting PolicyManager maps to a key only is found by that key
+            only when the element ids in its data pick out one policy. Only a
+            single match counts: there is no guessing between two.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param (
+        [Parameter(Mandatory)]
+        [pscustomobject]$Policy,
+
+        [Parameter(Mandatory)]
+        [pscustomobject]$Index
+    )
+
+    $cut = $Policy.Name.IndexOf('/')
+    $area = if ($cut -gt 0) { $Policy.Name.Substring(0, $cut) } else { '' }
+    $name = $Policy.Name.Substring($cut + 1)
+    $kind = 'NoMatch'
+    $reason = $null
+
+    if ($area -like 'ADMX_*') {
+        $file = $area.Substring(5)
+        $lookup = ('{0}|{1}' -f $file, $name).ToLowerInvariant()
+        if ($Index.ByFile.ContainsKey($lookup)) { return [pscustomobject]@{ Definition = $Index.ByFile[$lookup]; Kind = 'File'; Reason = $null } }
+        $fileKey = $file.ToLowerInvariant()
+        if ($Index.Failed.ContainsKey($fileKey)) {
+            $kind = 'Unreadable'
+            $reason = '{0}.admx could not be read: {1}' -f $file, $Index.Failed[$fileKey].TrimEnd('.')
+        }
+        elseif ($Index.Files.ContainsKey($fileKey)) {
+            $kind = 'NoPolicy'
+            $reason = '{0}.admx has no policy {1}' -f $file, $name
+        }
+        else {
+            $kind = 'NoFile'
+            $reason = '{0}.admx is not in {1}' -f $file, $Index.Directory
+        }
+    }
+    elseif ($area -match '^[^~]+~[^~]+~(.+)$') {
+        $lookup = ('{0}|{1}' -f $Matches[1], $name).ToLowerInvariant()
+        if ($Index.Ingested.ContainsKey($lookup)) { return [pscustomobject]@{ Definition = $Index.Ingested[$lookup]; Kind = 'Ingested'; Reason = $null } }
+        $named = @()
+        if ($Index.IngestedName.ContainsKey($name.ToLowerInvariant())) { $named = @($Index.IngestedName[$name.ToLowerInvariant()]) }
+        if (@($named | Select-Object -ExpandProperty Label -Unique).Count -eq 1) {
+            return [pscustomobject]@{ Definition = $named[0]; Kind = 'Ingested'; Reason = $null }
+        }
+        $kind = 'NoIngested'
+        $reason = if ($Index.Ingested.Count -eq 0) { 'no copy of the ingested ADMX files was found on this device' }
+        else { 'none of the ingested ADMX files found defines it' }
+    }
+
+    $ids = @()
+    if ($Policy.Value) { $ids = @(foreach ($match in [regex]::Matches($Policy.Value, '<data\s+id="([^"]*)"', 'IgnoreCase')) { $match.Groups[1].Value }) }
+    $offering = {
+        param ($Candidate)
+        $offered = @($Candidate.Elements | ForEach-Object { $_.Id })
+        @($ids | Where-Object { $offered -notcontains $_ }).Count -eq 0
+    }
+    $candidates = @()
+    if ($Policy.RedirectKey -and $Policy.RedirectValue) {
+        $lookup = Get-LocationId -Key $Policy.RedirectKey -ValueName $Policy.RedirectValue
+        if ($Index.ByValue.ContainsKey($lookup)) { $candidates = @($Index.ByValue[$lookup]) }
+        if ($candidates.Count -gt 1) {
+            $own = @($candidates | Where-Object { (Get-LocationId -Key $_.Key -ValueName $_.ValueName) -eq $lookup })
+            if ($own.Count -gt 0) { $candidates = $own }
+        }
+        if ($candidates.Count -gt 1 -and $ids.Count -gt 0) { $candidates = @($candidates | Where-Object { & $offering $_ }) }
+    }
+    elseif ($Policy.RedirectKey) {
+        # A key alone is weak evidence: other policies write under it, and the one that does
+        # may be in a file this device does not have. Only the element ids in the setting's
+        # own data can pick its policy out.
+        $lookup = (Get-KeyPath -Key $Policy.RedirectKey).ToLowerInvariant()
+        if ($ids.Count -gt 0 -and $Index.ByKey.ContainsKey($lookup)) { $candidates = @($Index.ByKey[$lookup] | Where-Object { & $offering $_ }) }
+        elseif (-not $reason) {
+            $kind = 'KeyOnly'
+            $reason = 'PolicyManager names only its key, and its value names no ADMX element to find the policy by'
+        }
+    }
+    $unique = @{}
+    foreach ($candidate in $candidates) { $unique[$candidate.Label] = $candidate }
+    if ($unique.Count -eq 1) {
+        $how = if ($Policy.RedirectValue) { 'Value' } else { 'Key' }
+        return [pscustomobject]@{ Definition = @($unique.Values)[0]; Kind = $how; Reason = $null }
+    }
+    if (-not $reason) {
+        if ($unique.Count -gt 1) {
+            $kind = 'Ambiguous'
+            $reason = '{0} ADMX policies match it: {1}' -f $unique.Count, (Format-NameList -Name @($unique.Keys | Sort-Object))
+        }
+        else {
+            $reason = 'no ADMX policy on this device matches it'
+        }
+    }
+    return [pscustomobject]@{ Definition = $null; Kind = $kind; Reason = $reason }
+}
+
+function Find-AdmxDefinition {
+    <#
+        .SYNOPSIS
+            The ADMX policies that write one registry value, or whose list
+            element fills its key: what the value is called in Group Policy.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param (
+        [Parameter(Mandatory)]
+        [pscustomobject]$Index,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Key,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$ValueName
+    )
+
+    $id = Get-LocationId -Key $Key -ValueName $ValueName
+    if ($Index.ByValue.ContainsKey($id)) { return $Index.ByValue[$id].ToArray() }
+    $listKey = (Get-KeyPath -Key $Key).ToLowerInvariant()
+    if ($Index.ByListKey.ContainsKey($listKey)) { return $Index.ByListKey[$listKey].ToArray() }
+    # Nothing, not $null: the caller wraps the result in @(), and @($null) holds one item.
+    return
+}
+
 function Get-CimValue {
     <#
         .SYNOPSIS
@@ -1097,6 +1949,8 @@ function Get-PolicyLocation {
 
     $id = Get-LocationId -Key $Key -ValueName $ValueName
     if (-not $Table.ContainsKey($id)) {
+        # Via: how each MDM setting was tied to the value. Expected: what each one's ADMX
+        # state means here, where its definition says.
         $Table[$id] = [pscustomobject]@{
             Key       = Get-KeyPath -Key $Key
             ValueName = $ValueName
@@ -1104,9 +1958,36 @@ function Get-PolicyLocation {
             Cached    = [System.Collections.Generic.List[object]]::new()
             Preferred = [System.Collections.Generic.List[object]]::new()
             Mdm       = [System.Collections.Generic.List[object]]::new()
+            Via       = @{}
+            Expected  = @{}
         }
     }
     return $Table[$id]
+}
+
+function Add-LocationPolicy {
+    <#
+        .SYNOPSIS
+            Ties an MDM setting to one registry value, recording how: Redirect
+            (PolicyManager maps the setting to it), Block (MDMWinsOverGP blocks
+            Group Policy there) or Admx (the setting's ADMX definition writes it).
+            The first tie is the one kept.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [pscustomobject]$Location,
+
+        [Parameter(Mandatory)]
+        [pscustomobject]$Policy,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Redirect', 'Block', 'Admx')]
+        [string]$Via
+    )
+
+    if (-not $Location.Mdm.Contains($Policy)) { $Location.Mdm.Add($Policy) }
+    if (-not $Location.Via.ContainsKey($Policy.Name)) { $Location.Via[$Policy.Name] = $Via }
 }
 
 function Find-KeyClaim {
@@ -1164,6 +2045,10 @@ function ConvertTo-PolicySourceRow {
         MatchedBy     = $Property['MatchedBy']
         RegistryPath  = $Property['RegistryPath']
         Note          = $Property['Note']
+        # Added in 1.2, after the 1.1 columns so that exports from both versions line up.
+        AdmxPolicy        = $Property['AdmxPolicy']
+        PolicyDisplayName = $Property['PolicyDisplayName']
+        MdmRegistryValue  = $Property['MdmRegistryValue']
     }
 
     $columns = [string[]]@('Verdict', 'Setting', 'LiveValue', 'GpValue', 'Gpo', 'MdmValue', 'MdmSource')
@@ -1203,6 +2088,13 @@ function Resolve-PolicySource {
             value. An MDM setting that writes one value and blocks Group Policy at
             another gets one row, the one with Group Policy in it.
 
+            With ADMX definitions (AdmxIndex), an ADMX-backed MDM setting whose
+            ADMX policy is found is tied to every registry value that policy
+            writes, with the value its state means there, and compared like any
+            other value. A value under its key that the policy does not write is
+            not credited to it. A setting whose policy is not found is matched
+            by key, as without definitions.
+
             A leftover - an MDM setting PolicyManager still lists, with no
             enrollment holding a value - never counts as the source of a value.
             It can explain a GPO setting that was not applied, or a value left
@@ -1231,7 +2123,11 @@ function Resolve-PolicySource {
         [Microsoft.Win32.RegistryKey]$Root,
 
         [Parameter()]
-        [bool]$MdmWinsOverGp
+        [bool]$MdmWinsOverGp,
+
+        [Parameter()]
+        [AllowNull()]
+        [object]$AdmxIndex
     )
 
     $leftoverNote = 'PolicyManager still lists it, but no enrollment holds a value for it, so no MDM applies it now. ' +
@@ -1243,19 +2139,32 @@ function Resolve-PolicySource {
     foreach ($entry in $GpCached) { (Get-PolicyLocation -Table $locations -Key $entry.Key -ValueName $entry.ValueName).Cached.Add($entry) }
     foreach ($entry in $Preference) { (Get-PolicyLocation -Table $locations -Key $entry.Key -ValueName $entry.ValueName).Preferred.Add($entry) }
 
+    # Values nobody claims are found by reading what is there. They are read before the MDM
+    # settings are placed, so that an ADMX list element can claim every value under its key.
+    foreach ($value in @(Get-RegistryValueLocation -Root $Root -Path $PoliciesPath)) {
+        $null = Get-PolicyLocation -Table $locations -Key $value.Key -ValueName $value.ValueName
+    }
+
     $gpKeys = @{}
     foreach ($entry in $GpApplied) { $gpKeys[(Get-KeyPath -Key $entry.Key).ToLowerInvariant()] = $true }
 
     # Each MDM setting goes to the registry value it writes. The value MDMWinsOverGP
-    # blocks is used too, but only where Group Policy has something there.
+    # blocks is used too, but only where Group Policy has something there. An ADMX-backed
+    # setting whose ADMX policy is found goes to every value that policy writes; one whose
+    # policy is not found is matched by key, below.
     $claims = @{}
     $leftoverClaims = @{}
-    $unplaced = [System.Collections.Generic.List[object]]::new()
+    $admxClaims = @{}
+    $listClaims = @{}
+    $definitions = @{}
+    $unresolved = @{}
+    $found = @{}
+    $placed = @{}
     foreach ($policy in $Mdm) {
-        $placed = $false
+        $placed[$policy.Name] = $false
         if ($policy.RedirectKey -and $policy.RedirectValue) {
-            (Get-PolicyLocation -Table $locations -Key $policy.RedirectKey -ValueName $policy.RedirectValue).Mdm.Add($policy)
-            $placed = $true
+            Add-LocationPolicy -Location (Get-PolicyLocation -Table $locations -Key $policy.RedirectKey -ValueName $policy.RedirectValue) -Policy $policy -Via Redirect
+            $placed[$policy.Name] = $true
         }
         if ($policy.BlockKey -and $policy.BlockValue) {
             $id = Get-LocationId -Key $policy.BlockKey -ValueName $policy.BlockValue
@@ -1263,26 +2172,82 @@ function Resolve-PolicySource {
                 $location = $locations[$id]
                 if (-not $location.Mdm.Contains($policy) -and
                     ($location.Applied.Count + $location.Cached.Count + $location.Preferred.Count) -gt 0) {
-                    $location.Mdm.Add($policy)
-                    $placed = $true
+                    Add-LocationPolicy -Location $location -Policy $policy -Via Block
+                    $placed[$policy.Name] = $true
                 }
             }
         }
-        if ($policy.AdmxBacked -and $policy.RedirectKey) {
+
+        $definition = $null
+        if ($policy.AdmxBacked -and $null -ne $AdmxIndex) {
+            $resolution = Resolve-AdmxPolicy -Policy $policy -Index $AdmxIndex
+            $found[$resolution.Kind] = 1 + [int]$found[$resolution.Kind]
+            $definition = $resolution.Definition
+            if ($null -eq $definition) { $unresolved[$policy.Name] = $resolution.Reason }
+        }
+
+        if ($null -ne $definition) {
+            $definitions[$policy.Name] = $definition
+            $wanted = @{}
+            $filled = @()
+            if (-not $policy.Leftover) {
+                $translated = ConvertFrom-AdmxState -Definition $definition -Value $policy.Value
+                if ($null -ne $translated) {
+                    $wanted = $translated.Value
+                    $filled = @($translated.ListKey | ForEach-Object { (Get-KeyPath -Key $_).ToLowerInvariant() })
+                }
+            }
+            $targets = [ordered]@{}
+            foreach ($write in $definition.Footprint) { $targets[(Get-LocationId -Key $write.Key -ValueName $write.ValueName)] = $write }
+            foreach ($id in @($wanted.Keys)) { if (-not $targets.Contains($id)) { $targets[$id] = $wanted[$id] } }
+            foreach ($id in @($targets.Keys)) {
+                $want = $null
+                if ($wanted.ContainsKey($id)) { $want = $wanted[$id] }
+                # A value the state sets but the registry lacks still gets a row; one it removes does not.
+                if (-not $locations.ContainsKey($id) -and ($null -eq $want -or $want.Absent -or $want.Loose)) { continue }
+                $location = Get-PolicyLocation -Table $locations -Key $targets[$id].Key -ValueName $targets[$id].ValueName
+                Add-LocationPolicy -Location $location -Policy $policy -Via Admx
+                if ($null -ne $want) { $location.Expected[$policy.Name] = $want }
+                $placed[$policy.Name] = $true
+            }
+            foreach ($listKey in $definition.ListKeys) {
+                $claimKey = (Get-KeyPath -Key $listKey).ToLowerInvariant()
+                if (-not $listClaims.ContainsKey($claimKey)) { $listClaims[$claimKey] = [System.Collections.Generic.List[object]]::new() }
+                $listClaims[$claimKey].Add([pscustomobject]@{ Policy = $policy; Filled = $filled -contains $claimKey })
+            }
+            if ($policy.RedirectKey) {
+                $claimKey = (Get-KeyPath -Key $policy.RedirectKey).ToLowerInvariant()
+                if (-not $admxClaims.ContainsKey($claimKey)) { $admxClaims[$claimKey] = [System.Collections.Generic.List[object]]::new() }
+                $admxClaims[$claimKey].Add($policy)
+            }
+        }
+        elseif ($policy.AdmxBacked -and $policy.RedirectKey) {
             $table = if ($policy.Leftover) { $leftoverClaims } else { $claims }
             $claimKey = (Get-KeyPath -Key $policy.RedirectKey).ToLowerInvariant()
             if (-not $table.ContainsKey($claimKey)) { $table[$claimKey] = [System.Collections.Generic.List[object]]::new() }
             $table[$claimKey].Add($policy)
         }
-        if (-not $placed) { $unplaced.Add($policy) }
     }
 
-    # Values nobody claims are found by reading what is there.
-    foreach ($value in @(Get-RegistryValueLocation -Root $Root -Path $PoliciesPath)) {
-        $null = Get-PolicyLocation -Table $locations -Key $value.Key -ValueName $value.ValueName
+    # Every value under the key an ADMX list element fills is an item of that list. Where
+    # the state gives the list, an item it does not hold is one the MDM removes.
+    if ($listClaims.Count -gt 0) {
+        $gone = [pscustomobject]@{ Text = $null; Absent = $true; Loose = $false }
+        foreach ($location in @($locations.Values)) {
+            $claimKey = $location.Key.ToLowerInvariant()
+            if (-not $listClaims.ContainsKey($claimKey)) { continue }
+            foreach ($claim in $listClaims[$claimKey]) {
+                Add-LocationPolicy -Location $location -Policy $claim.Policy -Via Admx
+                if ($claim.Filled -and -not $location.Expected.ContainsKey($claim.Policy.Name)) { $location.Expected[$claim.Policy.Name] = $gone }
+                $placed[$claim.Policy.Name] = $true
+            }
+        }
     }
+    $unplaced = @($Mdm | Where-Object { -not $placed[$_.Name] })
 
     $switchState = if ($MdmWinsOverGp) { 'on' } else { 'off' }
+    $translatedMatch = 0
+    $translatedDiffer = 0
     $results = [System.Collections.Generic.List[object]]::new()
     foreach ($location in $locations.Values) {
         $live = Get-LiveValue -Root $Root -Key $location.Key -Name $location.ValueName
@@ -1314,8 +2279,8 @@ function Resolve-PolicySource {
         }
         $gpApplies = $applied.Count -gt 0 -or $preferred.Count -gt 0
 
-        # When the MDM sends an ADMX state, the value it put in the registry is the one to
-        # compare a GPO's value with.
+        # When the MDM sends an ADMX state that cannot be translated, the value it put in the
+        # registry is the one to compare a GPO's value with.
         $againstLive = 'the registry does not hold the value'
         if ($null -ne $live) {
             if ($live -eq $gpValue) { $againstLive = 'the GPO wants the value the registry holds' }
@@ -1331,9 +2296,21 @@ function Resolve-PolicySource {
         }
         $mdmValue = $null
         $admx = $false
+        $expected = $null
+        $untranslated = $null
         if ($null -ne $policy) {
             $mdmValue = Format-MdmValue -Value $policy.Value
-            $admx = Test-AdmxState -Value $policy.Value
+            if ($location.Expected.ContainsKey($policy.Name)) { $expected = $location.Expected[$policy.Name] }
+            # An ADMX state is compared as a value once its definition says what it means here.
+            $admx = (Test-AdmxState -Value $policy.Value) -and $null -eq $expected
+            if ($admx -and $null -ne $AdmxIndex) {
+                $untranslated = if ($definitions.ContainsKey($policy.Name)) {
+                    'Its ADMX definition does not say what the state writes here.'
+                }
+                elseif ($unresolved.ContainsKey($policy.Name)) {
+                    'Its ADMX definition was not found: {0}.' -f $unresolved[$policy.Name]
+                }
+            }
         }
         $claimants = @(Find-KeyClaim -Claim $claims -Key $location.Key)
         $oldClaimants = @(Find-KeyClaim -Claim $leftoverClaims -Key $location.Key)
@@ -1342,11 +2319,21 @@ function Resolve-PolicySource {
         $matchedBy = $null
 
         if ($null -ne $policy) {
-            $matchedBy = 'Value'
+            $matchedBy = if ($location.Via[$policy.Name] -eq 'Admx') { 'Admx' } else { 'Value' }
             if ($gpApplies) {
                 if ($admx) {
                     $verdict = 'Both'
                     $notes.Add(('The MDM sends an ADMX state, not a value; {0}.' -f $againstLive))
+                }
+                elseif ($null -ne $expected) {
+                    if (Test-ExpectedValue -Expected $expected -Value $gpValue) { $verdict = 'Agree' }
+                    else {
+                        $verdict = 'Conflict'
+                        $holder = 'neither side'
+                        if ($null -ne $live -and $live -eq $gpValue) { $holder = 'Group Policy' }
+                        elseif (Test-ExpectedValue -Expected $expected -Value $live) { $holder = $policy.Source }
+                        $notes.Add(('The registry holds the value of {0}. MDMWinsOverGP is {1}.' -f $holder, $switchState))
+                    }
                 }
                 elseif ($gpValue -eq $policy.Value) {
                     $verdict = 'Agree'
@@ -1362,6 +2349,9 @@ function Resolve-PolicySource {
             elseif ($cached.Count -gt 0) {
                 $verdict = 'OverriddenByMdm'
                 $comparison = if ($admx) { $againstLive }
+                elseif ($null -ne $expected) {
+                    if (Test-ExpectedValue -Expected $expected -Value $gpValue) { 'both set the same value' } else { 'the values differ' }
+                }
                 elseif ($gpValue -eq $policy.Value) { 'both set the same value' }
                 else { 'the values differ' }
                 $notes.Add(('The GPO sets it, but {0} does and Group Policy did not apply it; {1}. MDMWinsOverGP is {2}.' -f
@@ -1369,10 +2359,19 @@ function Resolve-PolicySource {
             }
             else {
                 $verdict = 'MdmOnly'
-                if (-not $admx -and $null -ne $live -and $live -ne $policy.Value) {
+                if ($null -ne $expected) {
+                    if (Test-ExpectedValue -Expected $expected -Value $live) { $translatedMatch++ }
+                    else {
+                        $translatedDiffer++
+                        if ($null -eq $live) { $notes.Add('The registry does not hold the value the MDM''s ADMX state means here.') }
+                        else { $notes.Add('The registry holds a different value from the one the MDM''s ADMX state means: something wrote it after the MDM did.') }
+                    }
+                }
+                elseif (-not $admx -and $null -ne $live -and $live -ne $policy.Value) {
                     $notes.Add('The registry holds a different value: something wrote it after the MDM did.')
                 }
             }
+            if ($untranslated) { $notes.Add($untranslated) }
         }
         elseif ($gpApplies) {
             $verdict = 'GpOnly'
@@ -1396,7 +2395,7 @@ function Resolve-PolicySource {
             }
             elseif ($leftovers.Count -gt 0 -or $oldClaimants.Count -gt 0) {
                 $verdict = 'NotApplied'
-                $matchedBy = if ($leftovers.Count -gt 0) { 'Value' } else { 'Key' }
+                $matchedBy = if ($leftovers.Count -gt 0) { if ($location.Via[$leftovers[0].Name] -eq 'Admx') { 'Admx' } else { 'Value' } } else { 'Key' }
                 $explainedBy = @(if ($leftovers.Count -gt 0) { $leftovers } else { $oldClaimants })
                 $notes.Add(('The GPO sets it, but Group Policy did not apply it. PolicyManager still lists an MDM setting for it that no MDM applies any more; MDMWinsOverGP is {0}, and a leftover like this can still keep the GPO setting from applying.' -f
                         $switchState))
@@ -1424,13 +2423,21 @@ function Resolve-PolicySource {
         }
         elseif ($leftovers.Count -gt 0 -or $oldClaimants.Count -gt 0) {
             $verdict = 'Leftover'
-            $matchedBy = if ($leftovers.Count -gt 0) { 'Value' } else { 'Key' }
+            $matchedBy = if ($leftovers.Count -gt 0) { if ($location.Via[$leftovers[0].Name] -eq 'Admx') { 'Admx' } else { 'Value' } } else { 'Key' }
             $explainedBy = @(if ($leftovers.Count -gt 0) { $leftovers } else { $oldClaimants })
             $notes.Add($leftoverNote)
         }
         else {
             $verdict = 'Unclaimed'
             $notes.Add('None of the sources sets it: a script, an app, another management tool, or a Windows default.')
+        }
+
+        if ($matchedBy -eq 'Admx') { $notes.Add('Matched through the ADMX definition of the MDM setting, which writes this value.') }
+
+        # ADMX settings whose definitions were read, and leave this value out, do not claim it.
+        if ($null -eq $policy -and $explainedBy.Count -eq 0 -and $leftovers.Count -eq 0 -and $admxClaims.ContainsKey($location.Key.ToLowerInvariant())) {
+            $notes.Add(('MDM ADMX settings write under this key, but their ADMX definitions do not include this value: {0}.' -f
+                    (Format-NameList -Name ($admxClaims[$location.Key.ToLowerInvariant()] | ForEach-Object { $_.Name }))))
         }
 
         $valueLabel = if ($location.ValueName) { $location.ValueName } else { '(Default)' }
@@ -1450,39 +2457,58 @@ function Resolve-PolicySource {
             $mdmSourceKind = $explainedBy[0].SourceKind
         }
 
-        $row = ConvertTo-PolicySourceRow -Property @{
-            Verdict       = $verdict
-            Setting       = $setting
-            LiveValue     = $live
-            GpValue       = $gpValue
-            Gpo           = $gpo
-            OverriddenGpo = $overridden
-            GpSource      = $gpSource
-            MdmSetting    = $mdmSetting
-            MdmValue      = $mdmValue
-            MdmSource     = $mdmSource
-            MdmSourceKind = $mdmSourceKind
-            MatchedBy     = $matchedBy
-            RegistryPath  = "HKLM\$($location.Key)\$valueLabel"
-            Note          = $(if ($notes.Count -gt 0) { $notes -join ' ' } else { $null })
+        # The Group Policy name of the value: from the MDM setting's own ADMX policy, or
+        # else from every ADMX policy that writes it.
+        $named = @()
+        $tied = @(@($active) + @($leftovers) | Where-Object { $definitions.ContainsKey($_.Name) })
+        if ($tied.Count -gt 0) { $named = @($definitions[$tied[0].Name]) }
+        elseif ($null -ne $AdmxIndex) { $named = @(Find-AdmxDefinition -Index $AdmxIndex -Key $location.Key -ValueName $location.ValueName) }
+        $admxPolicy = $null; $displayName = $null
+        if ($named.Count -gt 0) {
+            $admxPolicy = Format-NameList -Name @($named | ForEach-Object { $_.Label })
+            $titles = @($named | Where-Object { $_.DisplayName } | ForEach-Object { $_.DisplayName })
+            if ($titles.Count -gt 0) { $displayName = Format-NameList -Name $titles }
         }
+
+        $row = ConvertTo-PolicySourceRow -Property @{
+            Verdict           = $verdict
+            Setting           = $setting
+            LiveValue         = $live
+            GpValue           = $gpValue
+            Gpo               = $gpo
+            OverriddenGpo     = $overridden
+            GpSource          = $gpSource
+            MdmSetting        = $mdmSetting
+            MdmValue          = $mdmValue
+            MdmSource         = $mdmSource
+            MdmSourceKind     = $mdmSourceKind
+            MatchedBy         = $matchedBy
+            RegistryPath      = "HKLM\$($location.Key)\$valueLabel"
+            Note              = $(if ($notes.Count -gt 0) { $notes -join ' ' } else { $null })
+            AdmxPolicy        = $admxPolicy
+            PolicyDisplayName = $displayName
+            MdmRegistryValue  = $(if ($null -ne $expected) { Format-ExpectedValue -Expected $expected } else { $null })
+        }
+        $names = @(@($active) + @($leftovers) | ForEach-Object { $_.Name })
         $results.Add([pscustomobject]@{
-                Row      = $row
-                Policies = @(@($active) + @($leftovers) | ForEach-Object { $_.Name })
-                HasGp    = ($applied.Count + $cached.Count + $preferred.Count) -gt 0
+                Row         = $row
+                Policies    = $names
+                HasGp       = ($applied.Count + $cached.Count + $preferred.Count) -gt 0
+                Blocked     = @($names | Where-Object { $location.Via[$_] -eq 'Block' })
+                ViaRedirect = $names.Count -eq 1 -and $location.Via[$names[0]] -eq 'Redirect'
             })
     }
 
     # One setting, one row: a setting that writes one value and blocks Group Policy at
     # another keeps the row with Group Policy in it, and that row's note says where the
-    # MDM's own value is.
+    # MDM's own value is. Values an ADMX definition ties a setting to keep their own rows.
     $withGp = @{}
     foreach ($result in $results) {
-        if ($result.HasGp) { foreach ($name in $result.Policies) { $withGp[$name] = $result } }
+        if ($result.HasGp) { foreach ($name in $result.Blocked) { $withGp[$name] = $result } }
     }
     $merged = @{}
     foreach ($result in $results) {
-        if (-not $result.HasGp -and $result.Policies.Count -eq 1 -and $withGp.ContainsKey($result.Policies[0])) {
+        if (-not $result.HasGp -and $result.ViaRedirect -and $withGp.ContainsKey($result.Policies[0])) {
             $kept = $withGp[$result.Policies[0]].Row
             $shown = if ($null -ne $result.Row.LiveValue) { $result.Row.LiveValue } else { 'not set' }
             $where = 'The MDM writes its own value to {0}: {1}.' -f $result.Row.RegistryPath, $shown
@@ -1496,9 +2522,16 @@ function Resolve-PolicySource {
 
     foreach ($policy in $unplaced) {
         $path = $null
+        $admxPolicy = $null; $displayName = $null
+        if ($definitions.ContainsKey($policy.Name)) {
+            $admxPolicy = $definitions[$policy.Name].Label
+            $displayName = $definitions[$policy.Name].DisplayName
+        }
         if ($policy.RedirectKey) {
             $path = 'HKLM\' + (Get-KeyPath -Key $policy.RedirectKey)
             $note = 'ADMX-backed: writes one or more values under this key.'
+            if ($definitions.ContainsKey($policy.Name)) { $note = 'ADMX-backed: none of the values its ADMX definition writes is in the registry.' }
+            elseif ($unresolved.ContainsKey($policy.Name)) { $note += (' Its ADMX definition was not found: {0}.' -f $unresolved[$policy.Name]) }
             if ($gpKeys.ContainsKey((Get-KeyPath -Key $policy.RedirectKey).ToLowerInvariant())) {
                 $note += ' Group Policy also sets values under this key.'
             }
@@ -1509,15 +2542,24 @@ function Resolve-PolicySource {
         if ($policy.Leftover) { $note = "$leftoverNote $note" }
 
         ConvertTo-PolicySourceRow -Property @{
-            Verdict       = $(if ($policy.Leftover) { 'Leftover' } else { 'MdmOnly' })
-            Setting       = $policy.Name
-            MdmSetting    = $policy.Name
-            MdmValue      = Format-MdmValue -Value $policy.Value
-            MdmSource     = $policy.Source
-            MdmSourceKind = $policy.SourceKind
-            RegistryPath  = $path
-            Note          = $note
+            Verdict           = $(if ($policy.Leftover) { 'Leftover' } else { 'MdmOnly' })
+            Setting           = $policy.Name
+            MdmSetting        = $policy.Name
+            MdmValue          = Format-MdmValue -Value $policy.Value
+            MdmSource         = $policy.Source
+            MdmSourceKind     = $policy.SourceKind
+            RegistryPath      = $path
+            Note              = $note
+            AdmxPolicy        = $admxPolicy
+            PolicyDisplayName = $displayName
         }
+    }
+
+    if ($null -ne $AdmxIndex) {
+        $tally = (@($found.Keys | Sort-Object | ForEach-Object { '{0} {1}' -f $_, $found[$_] }) -join ', ')
+        if (-not $tally) { $tally = 'none' }
+        Write-LogEntry -Message ('ADMX-backed MDM settings by how their ADMX policy was found: {0}. Where only the MDM writes a value, the value its state means matches the registry {1} times and differs {2} times.' -f
+            $tally, $translatedMatch, $translatedDiffer)
     }
 }
 
@@ -1551,7 +2593,7 @@ function Select-PolicySource {
         if ($Filter) {
             $matched = $false
             foreach ($pattern in $Filter) {
-                foreach ($text in @($candidate.Setting, $candidate.RegistryPath, $candidate.MdmSetting, $candidate.Gpo)) {
+                foreach ($text in @($candidate.Setting, $candidate.RegistryPath, $candidate.MdmSetting, $candidate.Gpo, $candidate.AdmxPolicy, $candidate.PolicyDisplayName)) {
                     if ($text -and $text -like $pattern) { $matched = $true; break }
                 }
                 if ($matched) { break }
@@ -1587,6 +2629,38 @@ try {
     $mdm = @(Get-MdmPolicy -Root $machine -Source $sources)
     $mdmWinsOverGp = (Get-LiveValue -Root $machine -Key "$PolicyManagerPath\current\device\ControlPolicyConflict" -Name 'MDMWinsOverGP') -eq '1'
     Write-LogEntry -Message ('MDM settings: {0}. MDMWinsOverGP: {1}.' -f $mdm.Count, $mdmWinsOverGp)
+
+    # ADMX definitions turn ADMX states into the values they mean. Without them the run
+    # still works: states are compared with the registry and ADMX settings matched by key.
+    Write-Progress -Activity 'Get-PolicySource' -Status 'Reading ADMX definitions'
+    $admxIndex = $null
+    try {
+        $admxTimer = [Diagnostics.Stopwatch]::StartNew()
+        $culture = [cultureinfo]::CurrentUICulture
+        $languages = @(@($culture.Name, $culture.Parent.Name, 'en-US') | Where-Object { $_ } | Select-Object -Unique)
+        # Where Windows keeps ingested ADMX files is not documented; these are the candidates.
+        $ingestedDirectories = @()
+        try {
+            $ingestedDirectories = @([IO.Directory]::GetDirectories((Join-Path -Path $env:ProgramData -ChildPath 'Microsoft'), 'PolicyManager*'))
+        }
+        catch {
+            Write-LogEntry -Message "Ingested ADMX: %ProgramData%\Microsoft could not be listed ($($_.Exception.GetType().Name)); only the registry is searched." -Level WARN
+        }
+        $admxIndex = Import-AdmxDefinition -Directory $PolicyDefinitionsDirectory -IngestedDirectory $ingestedDirectories -Root $machine -Language $languages
+        if ($admxIndex.Failed.Count -gt 0) {
+            $failures = @($admxIndex.Failed.Keys | Sort-Object | ForEach-Object { '{0}.admx ({1})' -f $_, $admxIndex.Failed[$_].TrimEnd('.') })
+            Write-Warning ('{0} ADMX file(s) in {1} could not be read, so the settings they define are compared as without ADMX definitions: {2}' -f
+                $failures.Count, $PolicyDefinitionsDirectory, ($failures -join '; '))
+        }
+        Write-LogEntry -Message ('ADMX definitions read in {0:N1} s: {1} files, {2} not readable, {3} without ADML; ingested documents: {4} from files, {5} from the registry.' -f
+            $admxTimer.Elapsed.TotalSeconds, $admxIndex.Files.Count, $admxIndex.Failed.Count, $admxIndex.WithoutAdml,
+            $admxIndex.IngestedFrom['File'], $admxIndex.IngestedFrom['Registry'])
+    }
+    catch {
+        $admxIndex = $null
+        Write-Warning "ADMX definitions could not be read, so ADMX states are compared with the registry and ADMX settings matched by key: $($_.Exception.Message)"
+        Write-LogEntry -Message "ADMX definitions: $($_.Exception.Message)" -Level WARN
+    }
 
     Write-Progress -Activity 'Get-PolicySource' -Status 'Reading Group Policy results'
     # The ADMX policy 'Turn off Resultant Set of Policy logging' sets RSoPLogging to 0.
@@ -1631,7 +2705,7 @@ try {
     Write-LogEntry -Message ('GPO cache entries: {0}; Preferences registry items: {1}.' -f $cached.Count, $preferences.Count)
 
     Write-Progress -Activity 'Get-PolicySource' -Status 'Matching the sources'
-    $rows = @(Resolve-PolicySource -Mdm $mdm -GpApplied $rsop.Entry -GpCached $cached -Preference $preferences -Root $machine -MdmWinsOverGp $mdmWinsOverGp)
+    $rows = @(Resolve-PolicySource -Mdm $mdm -GpApplied $rsop.Entry -GpCached $cached -Preference $preferences -Root $machine -MdmWinsOverGp $mdmWinsOverGp -AdmxIndex $admxIndex)
     $result = @(Select-PolicySource -Row $rows -Filter $Filter -Verdict $Verdict -IncludeWindowsInternal:$IncludeWindowsInternal)
     Write-Progress -Activity 'Get-PolicySource' -Completed
 

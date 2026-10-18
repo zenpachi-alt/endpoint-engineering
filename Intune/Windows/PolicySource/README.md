@@ -9,7 +9,7 @@ actually using.
 | File | Role |
 | --- | --- |
 | `Get-PolicySource.ps1` | Reads every local source of policy and returns one row per setting, with a verdict. |
-| `Get-PolicySource.Tests.ps1` | Pester tests: each reader against a registry tree built under `HKEY_CURRENT_USER`, each verdict, and the script run as a file. |
+| `Get-PolicySource.Tests.ps1` | Pester tests: each reader against a registry tree built under `HKEY_CURRENT_USER`, the ADMX reader against fixture files and the device's own `PolicyDefinitions`, each verdict, and the script run as a file. |
 
 ## Why it is needed
 
@@ -54,13 +54,18 @@ Run it in an elevated Windows PowerShell on the device:
 # Every column, with the note that explains each verdict
 .\Get-PolicySource.ps1 -Filter '*WindowsUpdate*' | Format-List
 
+# Remote Desktop settings by their Group Policy names, with what each side wants
+.\Get-PolicySource.ps1 -Filter '*Terminal Services*' |
+    Format-Table -Property Verdict, PolicyDisplayName, GpValue, MdmRegistryValue, LiveValue -Wrap
+
 # A file for the other team
 .\Get-PolicySource.ps1 | Export-Csv -Path .\PolicySource.csv -NoTypeInformation
 ```
 
 `-Filter` takes wildcards and tries each one against the setting, the registry
-path, the MDM setting and the GPO name. `-IncludeWindowsInternal` adds what
-Windows provisions for itself (see below).
+path, the MDM setting, the GPO name, the ADMX policy and its name in Group
+Policy. `-IncludeWindowsInternal` adds what Windows provisions for itself (see
+below).
 
 ### Verdicts
 
@@ -68,10 +73,10 @@ Rows come back in this order:
 
 | Verdict | Meaning |
 | --- | --- |
-| `Conflict` | Group Policy and an MDM both apply it, with different values. The note says whose value the registry holds. |
+| `Conflict` | Group Policy and an MDM both apply it, with different values. For an ADMX-backed MDM setting, the MDM's value is the one its state means (`MdmRegistryValue`). The note says whose value the registry holds. |
 | `OverriddenByMdm` | A GPO sets it, but Group Policy did not apply it because an MDM sets it too. The note says whether the GPO's value differs from the one in effect. |
 | `NotApplied` | A GPO sets it, Group Policy did not apply it, and no active MDM setting explains why. When a leftover is listed for it, the note says so; otherwise check the Group Policy operational log. |
-| `Both` | Both set it. Intune sends ADMX-backed settings as a state (`Enabled`, `Disabled`, with any data), not as the registry value, so the note compares the GPO's value with the registry instead. |
+| `Both` | Both set it. Intune sends ADMX-backed settings as a state (`Enabled`, `Disabled`, with any data), not as the registry value, and this setting's ADMX definition was not found, so the note compares the GPO's value with the registry instead and says why the definition is missing. |
 | `Agree` | Both set it, to the same value. |
 | `GpOnly` | Group Policy only: a registry policy setting, a Preferences item, or a wireless profile. |
 | `MdmOnly` | Intune or another MDM only. |
@@ -94,12 +99,16 @@ matching GPO setting from applying, although nothing applies the MDM's.
 | `GpSource` | `Registry policy`, `Preferences`, `Wireless profile`, or `GPO, not applied`. |
 | `MdmSetting`, `MdmValue` | The MDM setting and its value. An ADMX state is shown as `Enabled: id=value; ...`. |
 | `MdmSource`, `MdmSourceKind` | Who set it: `Intune`, another MDM's provider name, `Windows`, or `None` for a leftover. |
-| `MatchedBy` | How the row was tied to the MDM setting: `Value` when the setting writes exactly this value, `Key` when an ADMX-backed setting writes several values under this key and which one is not known. A match by key is weaker evidence. |
+| `MatchedBy` | How the row was tied to the MDM setting: `Value` when PolicyManager maps the setting to exactly this value, `Admx` when the setting's ADMX definition writes this value, `Key` when the setting's ADMX definition was not found and it writes somewhere under this key. A match by key is weaker evidence. |
 | `RegistryPath` | The registry value, from `HKLM`. |
 | `Note` | Why the verdict is what it is, and anything that does not add up. A value written after Group Policy or the MDM is one example. |
+| `AdmxPolicy` | The ADMX policy that writes this value, as `File.admx: PolicyName` or `ingested Prefix: PolicyName`. For an MDM setting, its own; otherwise every policy that writes the value, up to three. |
+| `PolicyDisplayName` | That policy's name in the Group Policy editor, from the ADML in the device's language, or English. Empty when the ADMX file has no ADML, as with ingested files. |
+| `MdmRegistryValue` | The value an ADMX-backed MDM setting's state means here, worked out from its ADMX definition: a value, `not set` when the state removes it, or `0 or not set` where the ADMX leaves Windows the choice. |
 
 Only the first seven columns show by default; `Format-List` or `Select-Object *`
-shows the rest.
+shows the rest. The last three were added in 1.2, after the others, so an
+export from 1.1 and one from 1.2 line up column for column.
 
 ### How it decides
 
@@ -112,6 +121,7 @@ internet, so it works off the corporate network.
 | Group Policy | RSoP, `root\rsop\computer` | The applied registry settings, the winning GPO, the GPOs that lost |
 | GPO cache | `%windir%\System32\GroupPolicy\DataStore` | Each applied GPO's own `Registry.pol`, including settings that were not applied |
 | Preferences | `%ProgramData%\Microsoft\Group Policy\History` | Group Policy Preferences registry items |
+| ADMX | `%windir%\PolicyDefinitions`, and the copies Windows keeps of ADMX files an MDM ingested | What each policy writes to the registry, and its name in Group Policy |
 | Registry | The value itself | What Windows reads now |
 
 PolicyManager records, for each setting, the registry value it writes
@@ -124,8 +134,9 @@ stored at its registry location, in the winning enrollment's own store under
 `providers`.
 
 A GPO setting in the cache that RSoP does not show was not applied. When an MDM
-setting writes the same value, or writes under the same key as an ADMX-backed
-setting, that is `OverriddenByMdm`.
+setting writes the same value, directly or through its ADMX definition, that is
+`OverriddenByMdm`, and so is a value under the key of an ADMX-backed setting
+whose definition was not found.
 
 A setting with no winning enrollment and no value is a leftover. The `knobs`
 area is always Windows' own, whatever its record says, and the copies of list
@@ -136,6 +147,49 @@ says where the MDM's own value is.
 
 `gpresult` is not used. It needs a domain controller and stalls for minutes
 without one, and the RSoP data and the cache together hold what it would add.
+
+### ADMX-backed settings
+
+Intune sends an ADMX-backed setting as a state, such as `<enabled/>` with
+`<data id="..." value="..."/>` for each option, and Windows writes the
+registry values the setting's ADMX definition gives for that state. The script
+reads the same definitions and works out those values, so it can compare them
+with Group Policy's and with the registry.
+
+It finds the ADMX policy behind an MDM setting in this order, and takes a match
+only when there is exactly one:
+
+1. `ADMX_<File>/<Policy>` names the file and the policy.
+2. An ingested area, `<App>~<SettingType>~<category path>`, names the policy by
+   its category path in the ingested files.
+3. The registry value PolicyManager maps the setting to, when one policy writes
+   it.
+4. A setting PolicyManager maps to a key only: the policy under that key that
+   offers every element id in the setting's data.
+
+The state then becomes values: `enabledValue` (1 when the ADMX gives none) and
+the `enabledList`, and each element from its data. A `decimal` gives its number,
+a `boolean` its `trueValue` or `falseValue`, an `enum` the value of the chosen
+item plus that item's `valueList`, `text` the string, `multiText` its lines,
+and a `list` its name and value pairs. `<disabled/>` removes the element values
+and writes `disabledValue` and the `disabledList`. Where the ADMX gives no
+`disabledValue` or `falseValue`, Windows may write 0 or remove the value, so
+both count as the state's value.
+
+The setting is then tied to each value its policy writes (`MatchedBy` `Admx`),
+and compared like any other value. A value under the same key that the policy
+does not write is not credited to it, and its note names the settings that were
+ruled out. A setting whose policy is not found is compared as before: the GPO's
+value against the registry, and a match by key, with a note saying why.
+
+Ingested files: Microsoft documents that Windows keeps a copy on disk but not
+where. The script looks for ADMX content, whatever the file is called, under
+`%ProgramData%\Microsoft\PolicyManager*` and in PolicyManager's `AdmxInstalled`
+key, and the log says how many it found.
+
+Reading every ADMX file and its ADML takes a few seconds in Windows PowerShell
+5.1. They are read on every run, not cached, so the result always matches the
+files on the device.
 
 ### What it leaves out
 
@@ -148,11 +202,11 @@ without one, and the RSoP data and the cache together hold what it would add.
 - **User settings.** Only computer settings are read.
 - **Security settings**: password and lockout policy, user rights, audit. They
   are applied by a separate engine, not through the registry.
-- **Translating ADMX states.** An MDM state such as `Enabled` is not turned
-  into the registry value it means. The GPO's value is compared with the value
-  in the registry instead, which is the MDM's when the MDM wins.
-- **Which ADMX setting wrote a value matched by key.** `MdmSetting` lists every
-  ADMX-backed setting that writes under the key, and notes name up to three.
+- **ADMX files that are not on the device.** The central store is on SYSVOL and
+  needs a domain controller, so only the device's own files are read. A setting
+  whose definition is missing (some `ADMX_*` areas name files Windows no longer
+  ships) is compared and matched by key as before. Its `MdmSetting` lists every
+  such setting that writes under the key, and notes name up to three.
 
 `Unclaimed` is only looked for under `HKLM\SOFTWARE\Policies`. A value a script
 writes anywhere else is not reported.
@@ -184,9 +238,14 @@ If RSoP logging is turned off (policy *Turn off Resultant Set of Policy
 logging*), the script stops with `1` rather than report every Group Policy
 setting as missing. If the GPO cache or the Preferences history cannot be read,
 it warns and carries on without `OverriddenByMdm`, `NotApplied` or Preferences.
+If the ADMX files cannot be read, or one of them cannot, it warns, names them,
+and compares the settings they define as without ADMX definitions.
 
 The log, `%ProgramData%\EndpointEngineering\Logs\Get-PolicySource.log`, holds
-counts and timings, not values.
+counts and timings, not values. For ADMX it records how many files were read,
+how many ADMX-backed settings had their policy found, counted by how or by why
+not, and how often the value a state means matched the registry where only the
+MDM writes it.
 
 ### The output is organisation data
 
@@ -198,16 +257,19 @@ and read it.
 
 ## Verification status
 
-The tests cover each source reader, the `Registry.pol` parser, every verdict,
-and the filters. They run under Windows PowerShell 5.1 and PowerShell 7. The
+The tests cover each source reader, the `Registry.pol` parser, the ADMX reader
+and translation against fixture files, every verdict, and the filters. One test
+reads the device's own `PolicyDefinitions` and translates a Remote Desktop
+state through it. They run under Windows PowerShell 5.1 and PowerShell 7. The
 script itself is run as a file: unelevated it stops at the elevation check with
 `1`, and elevated, as in CI, it must finish with `0`.
 
-It has been run on a hybrid-joined, Intune-enrolled device, and the verdicts
-held.
+Version 1.1 has been run on a hybrid-joined, Intune-enrolled device, and the
+verdicts held.
 
 Not yet exercised: the verdicts against a deliberately conflicting GPO and
-Intune policy, and a device with `MDMWinsOverGP` off.
+Intune policy, a device with `MDMWinsOverGP` off, and the ADMX translation
+(1.2) on an enrolled device, including where Windows keeps ingested files.
 
 ## Reference
 
