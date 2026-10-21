@@ -24,9 +24,10 @@ outside my organisation.
   file from the repository. A launcher beside its own script, such as the
   Autopilot `.cmd`, is part of that unit rather than a dependency. Code that
   several scripts need is copied into each of them and kept identical by a
-  test, never loaded from a shared file at run time. The one exception is
-  `Tools/Invoke-RepositoryCheck.ps1`, which exists to run this repository's
-  own scanner and tests, and so runs only inside a clone.
+  test, never loaded from a shared file at run time. The exceptions are the
+  two `Tools/` scripts that exist to check this repository, and so run only
+  inside a clone: `Invoke-RepositoryCheck.ps1`, which runs its scanner and
+  tests, and `Test-EditedScript.ps1`, which reads its analyzer settings.
 - **`Standalone/` is not a junk drawer.** A script goes there because it is
   genuinely self-contained, not because deciding was hard. Anything that would
   be delivered through Intune or would talk to Graph belongs in the folder that

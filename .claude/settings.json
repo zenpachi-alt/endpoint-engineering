@@ -49,5 +49,25 @@
       "Bash(gh pr merge *)",
       "PowerShell(gh pr merge *)"
     ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh",
+            "args": [
+              "-NoProfile",
+              "-NonInteractive",
+              "-File",
+              "${CLAUDE_PROJECT_DIR}/Tools/Test-EditedScript.ps1"
+            ],
+            "timeout": 60
+          }
+        ]
+      }
+    ]
   }
 }
