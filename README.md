@@ -169,11 +169,13 @@ documentation, and the rule against committing real tenant identifiers) are in
 [CLAUDE.md](CLAUDE.md).
 
 Claude Code sessions in this repo are held to
-[`.claude/settings.json`](.claude/settings.json), which only restricts. It blocks
-force-pushes, commits that skip the pre-commit hook, changes to the GitHub
-repository's settings, unmasked scanner output, and reads of secret files, and
-it asks before reading tenant exports, pushing, or merging a pull request.
-Personal allow rules belong in the git-ignored `.claude/settings.local.json`.
+[`.claude/settings.json`](.claude/settings.json). Its permission rules only
+restrict: they block force-pushes, commits that skip the pre-commit hook,
+changes to the GitHub repository's settings, unmasked scanner output, and reads
+of secret files, and ask before reading tenant exports, pushing, or merging a
+pull request. Its hook runs PSScriptAnalyzer over each PowerShell file Claude
+edits, so a finding that would fail CI comes back in the same turn. Personal
+allow rules belong in the git-ignored `.claude/settings.local.json`.
 
 ## Licence and usage
 

@@ -10,6 +10,8 @@ operate on this repository itself.
 | `Test-SensitiveContent.ps1` | Scans files or staged content for tenant identifiers and credential material. |
 | `Install-GitHook.ps1` | Points `core.hooksPath` at `Tools/Hooks`, enabling the pre-commit scan in this clone. |
 | `Hooks/pre-commit` | Runs the scan against staged content and blocks the commit on a finding. |
+| `Test-EditedScript.ps1` | Runs PSScriptAnalyzer over one file the way CI does. The Claude Code hook calls it after every edit. |
+| `Test-EditedScript.Tests.ps1` | Pester tests for it, running copies in TestDrive as child processes. |
 
 ## Setting up a clone
 
@@ -61,6 +63,26 @@ CI passes, also fails the run when the Graph helper tests would load a
 `Microsoft.Graph.Authentication` other than the pinned one: they import the
 highest version installed, so a newer copy would silently replace the pin.
 Locally that is a warning.
+
+## The Claude Code hook
+
+[`.claude/settings.json`](../.claude/settings.json) starts `Test-EditedScript.ps1`
+under `pwsh` after every Edit or Write in a Claude Code session. It checks the
+one file the edit touched, the way the `Analyzer` and `Compatibility` checks
+would. On a finding it exits `2` with one line per finding, and Claude Code
+hands those lines to Claude in the same turn. Other files, and files outside
+the repository, are ignored.
+
+```powershell
+# The same check by hand: silent with exit code 0 when clean, 2 on findings.
+.\Tools\Test-EditedScript.ps1 -Path .\Tools\Install-GitHook.ps1
+```
+
+It needs PSScriptAnalyzer at the pinned version for PowerShell 7, which
+`-InstallModule` installs. It carries its own copy of that pin, because no
+script here loads another, and its tests fail while the copy differs from
+`$PinnedModule`: raise both together. It covers the analyzer only. The scan,
+Pester and the 5.1 parser still run before a commit and in CI.
 
 ## Running the scan by hand
 

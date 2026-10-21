@@ -135,8 +135,9 @@ $ErrorActionPreference = 'Stop'
 $ExitPassed = 0
 $ExitFailed = 1
 
-# The only place module versions are pinned: CI installs and imports exactly these. Raise one
-# only after every check passes locally against the new release.
+# The module versions CI installs and imports, exactly. Raise one only after every check passes
+# locally against the new release. Test-EditedScript.ps1 carries a copy of the PSScriptAnalyzer
+# pin, and its tests fail until the copy is raised too.
 $PinnedModule = @{
     'PSScriptAnalyzer'               = [version]'1.25.0'
     'Pester'                         = [version]'6.2.0'
