@@ -170,10 +170,10 @@ documentation, and the rule against committing real tenant identifiers) are in
 
 Claude Code sessions in this repo are held to
 [`.claude/settings.json`](.claude/settings.json), which only restricts. It blocks
-force-pushes, changes to the GitHub repository's settings, unmasked scanner
-output, and reads of secret files, and it asks before reading tenant exports,
-pushing, or merging a pull request. Personal allow rules belong in the
-git-ignored `.claude/settings.local.json`.
+force-pushes, commits that skip the pre-commit hook, changes to the GitHub
+repository's settings, unmasked scanner output, and reads of secret files, and
+it asks before reading tenant exports, pushing, or merging a pull request.
+Personal allow rules belong in the git-ignored `.claude/settings.local.json`.
 
 ## Licence and usage
 
