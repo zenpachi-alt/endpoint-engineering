@@ -31,6 +31,7 @@ otherwise, and anything that writes supports `-WhatIf`.
 | [`Get-ManagedDeviceInventory.ps1`](Graph/Devices/README.md#get-manageddeviceinventoryps1) | Every Intune managed device in the tenant, filterable, with optional CSV export. |
 | [`Remove-StaleEntraDevice.ps1`](Graph/Devices/README.md#remove-staleentradeviceps1) | Finds stale Entra device objects, disables them, and deletes them after a grace period. One explicit stage per run, report by default; deletion cannot be undone. |
 | [`Add-GroupDeviceMember.ps1`](Graph/Groups/README.md#add-groupdevicememberps1) | Resolves device names to Entra object IDs, filtered by join type and recent activity, and adds them to a group or writes the portal's bulk import CSV. |
+| [`Get-GroupAssignment.ps1`](Graph/Groups/README.md#get-groupassignmentps1) | Finds everything in Intune assigned to a group, by name or object ID, directly or through a parent group, and reports what it could and could not read. |
 
 ### Run on a device
 

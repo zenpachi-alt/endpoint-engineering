@@ -10,7 +10,7 @@ a device, or that run on one, belong under `Intune/` instead.
 | `Autopilot/` | Registering and reporting on Windows Autopilot device identities. |
 | `Configuration/` | Backup and reporting over Intune configuration objects: remediations, scripts, profiles, compliance policies, Windows update policies. |
 | `Devices/` | Managed device reporting and inventory, and cleanup of stale Entra device objects. |
-| `Groups/` | Group membership changes: resolving device names to object IDs and adding them to groups. |
+| `Groups/` | Group membership changes, resolving device names to object IDs and adding them to groups, and finding where a group is assigned in Intune. |
 
 ## Conventions for everything in this folder
 
