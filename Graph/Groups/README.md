@@ -1,10 +1,12 @@
 # Groups
 
-Group membership changes made from a workstation against the tenant.
+Group membership changes made from a workstation against the tenant, and
+finding where a group is used before changing it.
 
 | Script | Purpose |
 | --- | --- |
 | `Add-GroupDeviceMember.ps1` | Resolves a list of device names to Entra device object IDs, filtered by join type and recent activity, and adds them to a group or writes the portal's bulk import CSV. |
+| `Get-GroupAssignment.ps1` | Finds everything in Intune assigned to a group, by name or object ID, directly or through a parent group, and reports what it could and could not read. Read-only. |
 
 ## Add-GroupDeviceMember.ps1
 
@@ -172,3 +174,187 @@ show is a real tenant's answers.
 - [device resource type](https://learn.microsoft.com/graph/api/resources/device)
 - [Bulk add group members](https://learn.microsoft.com/entra/identity/users/groups-bulk-import-members)
 - [Manage stale devices: the activity timestamp](https://learn.microsoft.com/entra/identity/devices/manage-stale-devices)
+
+## Get-GroupAssignment.ps1
+
+A group can be assigned in many places, and Intune keeps each assignment on the
+policy, app or script it belongs to. Neither the admin center nor Graph can be
+asked what a group is assigned, so before changing a group there is no quick way
+to see what the change would touch. This script reads every object in the
+sources below, reads each object's assignments, and lists the ones that name the
+group. It never writes to the tenant.
+
+### Prerequisites
+
+| Requirement | Detail |
+| --- | --- |
+| PowerShell | 5.1 or 7 |
+| Module | `Microsoft.Graph.Authentication` 2.0.0 or later |
+| Graph scopes | Always `DeviceManagementConfiguration.Read.All` and `GroupMember.Read.All`. By `-Category`, see below. The `ReadWrite` equivalents are accepted where already granted, as are `Group.Read.All` and `Directory.Read.All` for the group. |
+| Admin consent | Required for every scope, once per tenant |
+| Licensing | Microsoft Intune Plan 1 |
+| Role | Any Intune role that can read these objects; read-only operator roles are enough. Reading groups: any member user, unless default user permissions are restricted. |
+
+```powershell
+Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
+```
+
+### Examples
+
+```powershell
+# Everything assigned to the group, or to a group it is nested in
+.\Get-GroupAssignment.ps1 -GroupName 'Pilot devices'
+
+# By object ID, signing in with a device code, with the files written to C:\Reports
+.\Get-GroupAssignment.ps1 -GroupId '<GroupId>' -UseDeviceCode -OutputPath C:\Reports
+
+# Apps and scripts only
+.\Get-GroupAssignment.ps1 -GroupName 'Pilot devices' -Category Apps, Scripts
+
+# Where the group is excluded, which is where removing it widens a deployment
+.\Get-GroupAssignment.ps1 -GroupName 'Pilot devices' |
+    Where-Object Assignment -eq 'Exclude' | Format-Table ObjectType, ObjectName, AssignedGroup
+```
+
+### Finding the group
+
+`-GroupName` is the whole display name, compared without regard to case. Graph
+does not keep display names unique, so a name that belongs to more than one
+group stops the run and lists their object IDs. None is chosen: rerun with
+`-GroupId`.
+
+An object ID that no group has is searched for anyway, with a warning, because
+an assignment can outlive the group it names.
+
+The groups the group is nested in are searched as well, since their assignments
+reach its members. Those records have `Relationship` `Inherited` and name the
+parent in `AssignedGroup`.
+
+### Records
+
+One record per assignment, returned on the pipeline and written to the report.
+
+| Column | Meaning |
+| --- | --- |
+| `Category`, `ObjectType` | The `-Category` the object belongs to, and what kind of object it is. |
+| `ObjectName`, `ObjectId` | The policy, app or script. |
+| `Assignment` | What the group does there; see below. |
+| `Intent` | For apps: `required`, `available`, `uninstall` or `availableWithoutEnrollment`. |
+| `FilterName`, `FilterId`, `FilterMode` | The assignment filter, and whether it includes or excludes. |
+| `Relationship` | `Direct`, or `Inherited` through a parent group. |
+| `AssignedGroup`, `AssignedGroupId` | The group the assignment names: the group searched for, or its parent. |
+| `Source` | `policySets` when a policy set delivers the assignment. Change it there, not on the object. Blank where Graph does not say. |
+
+| Assignment | Meaning |
+| --- | --- |
+| `Include` | The object is deployed to the group. |
+| `Exclude` | The group is held out of the object. **Removing it from an exclusion widens the deployment**, the opposite of what removing a group usually does. |
+| `RoleMember` | The group's members hold the Intune role. |
+| `RoleScope` | The Intune role can manage the group's members. |
+
+### Coverage
+
+An empty result can be acted on, so what was searched matters as much as what
+was found. Every run writes a coverage report with one row per source and prints
+it, and a source that could not be read is never treated as holding nothing.
+
+| Status | Meaning |
+| --- | --- |
+| `Complete` | Every object in the source was read. |
+| `Partial` | Part of the source could not be read, or an assignment names a target the script cannot read. `Detail` says which. |
+| `Failed` | The source could not be read at all. |
+| `NotSearched` | `-Category` left the source out. |
+| `NotApplicable` | Only for parent groups, of a group that does not exist. |
+
+The first HTTP 403 ends a source, because every later request would be refused
+for the same reason. A target of a type the script does not know is not assumed
+to be a different group: it marks the source `Partial`.
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Every selected source was read. Finding nothing is a result, not a failure. |
+| `1` | The script failed before searching: sign-in, or a group name that is unknown or ambiguous. |
+| `2` | The records are returned, but part of the search could not be read, so they may be incomplete. |
+
+The code is the same in a session, as `$LASTEXITCODE`, and from `pwsh -File`.
+
+### Sources
+
+| `-Category` | Searches | Scope of its own |
+| --- | --- | --- |
+| `ConfigurationProfiles` | Device configuration profiles, settings catalog policies, administrative templates, security baseline intents | None |
+| `CompliancePolicies` | Compliance policies | None |
+| `Scripts` | Remediations, Windows platform scripts, macOS shell scripts and custom attributes | `DeviceManagementScripts.Read.All` |
+| `WindowsUpdates` | Feature, quality, expedited and driver update policies | None |
+| `Apps` | Apps, app configuration for devices and for apps, app protection for iOS, Android and Windows | `DeviceManagementApps.Read.All` |
+| `Enrollment` | Enrollment configurations, Autopilot profiles, terms and conditions | `DeviceManagementServiceConfig.Read.All` |
+| `PolicySets` | Policy sets | None |
+| `Roles` | Intune role assignments, scope tags | `DeviceManagementRBAC.Read.All` |
+
+Every category is searched by default. One left out asks for no scope of its
+own, which is the way to run where a scope has not been consented to yet.
+
+The run takes about one request per object, plus one per source, so a large
+tenant takes minutes. Apps are read one at a time because Microsoft has
+deprecated `$expand=assignments` on the app list. The macOS script collections
+are read through `$expand` on each object, because the documented assignments
+path of `deviceShellScripts` answers HTTP 400.
+
+Intune is read on beta. Most of these collections exist nowhere else. A change
+in the beta contract shows up as a `Failed` or `Partial` source, not as a missing
+record.
+
+### What it does not show
+
+**It shows where a group is used in Intune, not that a group is safe to delete.**
+
+- Anything outside Intune: Conditional Access, Entra roles, enterprise apps,
+  group-based licensing, access packages, Exchange, SharePoint, Teams.
+- Within Intune: Windows Autopatch groups, which have no documented Graph API
+  (the policies and Entra groups they create are searched like any other),
+  Windows 365 provisioning policies, branding profiles, eSIM activation pools,
+  managed e-books, iOS app provisioning profiles, S mode supplemental policies,
+  and the device group of an enrollment time grouping policy.
+- Objects outside the signed-in account's Intune scope tags. Graph does not
+  return them and gives no sign that they exist, so use an account that sees
+  every object before trusting an empty result.
+
+### Output files
+
+Both files are written to `-OutputPath`, which defaults to the temp directory.
+They name real policies and groups, so keep them out of this repository.
+
+- `GroupAssignment-<timestamp>.csv` is every record. It is not written when
+  nothing was found.
+- `GroupAssignment-<timestamp>-Coverage.csv` is every source and its status. It
+  is written on every run that reaches the search.
+
+### How it is tested
+
+`Get-GroupAssignment.Tests.ps1` loads the script's functions and runs the body
+of its main block against a stand-in tenant held in memory, keyed by URI, so a
+request for the wrong path fails. The tests cover:
+
+- finding a group by name and by ID, a shared name, a quote in a name, and a
+  group that no longer exists
+- parent groups, including the directory roles and administrative units that
+  come back with them
+- every kind of target: include, exclude, all devices, a group held in
+  `entraObjectId`, a target type the script does not know, and no target at all
+- role assignments, and each source's way of being read
+- every way a read can fail, each of which must show in the coverage report and
+  never pass for nothing assigned
+- filter names, the scopes each category asks for, and the exit code
+- the script started with `-File` in a child process, for its exit code and its
+  message; skipped where `Microsoft.Graph.Authentication` is not installed
+
+The tests run under Windows PowerShell 5.1 and PowerShell 7. What they cannot
+show is a real tenant's answers.
+
+### Reference
+
+- [Intune in Microsoft Graph](https://learn.microsoft.com/graph/api/resources/intune-graph-overview)
+- [List group transitive memberOf](https://learn.microsoft.com/graph/api/group-list-transitivememberof)
+- [Assignment targets](https://learn.microsoft.com/graph/api/resources/intune-shared-deviceandappmanagementassignmenttarget)
+- [Intune role assignments](https://learn.microsoft.com/graph/api/resources/intune-rbac-deviceandappmanagementroleassignment)
+- [mobileApp: listing with `$expand=assignments` is deprecated](https://learn.microsoft.com/graph/api/resources/intune-apps-mobileapp)
