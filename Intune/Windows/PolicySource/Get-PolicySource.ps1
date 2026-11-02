@@ -40,7 +40,9 @@
 
     Verdicts, most important first:
         Conflict         Group Policy and Intune both apply it, with different
-                         values.
+                         values. With MDMWinsOverGP on, the switch does not
+                         cover it: it blocks only Policy CSP settings, and the
+                         two sides write the value in turn.
         OverriddenByMdm  A GPO sets it, but it was not applied because Intune
                          sets it too (ControlPolicyConflict/MDMWinsOverGP). RSoP
                          and rsop.msc do not show these.
@@ -128,8 +130,8 @@
 
 .NOTES
     Author        : Tomasz Pietryka
-    Version       : 1.2.0
-    Last updated  : 2026-10-18
+    Version       : 1.2.1
+    Last updated  : 2026-11-02
 
     PowerShell    : Windows PowerShell 5.1. It runs on the device, where
                     PowerShell 7 cannot be assumed.
@@ -2246,6 +2248,13 @@ function Resolve-PolicySource {
     $unplaced = @($Mdm | Where-Object { -not $placed[$_.Name] })
 
     $switchState = if ($MdmWinsOverGp) { 'on' } else { 'off' }
+    # Group Policy applying a value an MDM sets, with the switch on, shows the switch does not cover it.
+    $conflictSwitchNote = if ($MdmWinsOverGp) {
+        'MDMWinsOverGP is on, but Group Policy applied it anyway, so both sides write it in turn and the ' +
+        'value changes with whichever wrote last: set it in one place. The switch covers only Policy CSP ' +
+        'settings, not those of other CSPs such as BitLocker or Defender.'
+    }
+    else { 'MDMWinsOverGP is off.' }
     $translatedMatch = 0
     $translatedDiffer = 0
     $results = [System.Collections.Generic.List[object]]::new()
@@ -2332,7 +2341,7 @@ function Resolve-PolicySource {
                         $holder = 'neither side'
                         if ($null -ne $live -and $live -eq $gpValue) { $holder = 'Group Policy' }
                         elseif (Test-ExpectedValue -Expected $expected -Value $live) { $holder = $policy.Source }
-                        $notes.Add(('The registry holds the value of {0}. MDMWinsOverGP is {1}.' -f $holder, $switchState))
+                        $notes.Add(('The registry holds the value of {0}. {1}' -f $holder, $conflictSwitchNote))
                     }
                 }
                 elseif ($gpValue -eq $policy.Value) {
@@ -2343,7 +2352,7 @@ function Resolve-PolicySource {
                     $holder = 'neither side'
                     if ($live -eq $gpValue) { $holder = 'Group Policy' }
                     elseif ($live -eq $policy.Value) { $holder = $policy.Source }
-                    $notes.Add(('The registry holds the value of {0}. MDMWinsOverGP is {1}.' -f $holder, $switchState))
+                    $notes.Add(('The registry holds the value of {0}. {1}' -f $holder, $conflictSwitchNote))
                 }
             }
             elseif ($cached.Count -gt 0) {
