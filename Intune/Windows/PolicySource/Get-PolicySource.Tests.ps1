@@ -1027,6 +1027,19 @@ Describe 'Get-PolicySource' -Skip:([Environment]::OSVersion.Platform -ne 'Win32N
             (Invoke-Resolve -MdmWinsOverGp $false -Mdm $mdm -Applied $applied)[0].Verdict | Should -Be 'Both'
         }
 
+        It 'Conflict with MDMWinsOverGP on says the switch does not cover the setting' {
+            # The shape of a BitLocker CSP setting: ADMX-backed, mapped by redirect, with no Group Policy block.
+            Write-TestValue -Path 'SOFTWARE\Policies\Fixture' -Value @{ Simple = 1 }
+            $mdm = @(Get-TestAdmxPolicy -Name 'Fixture/SimpleSwitch' -Key 'SOFTWARE\Policies\Fixture' -ValueName 'Simple')
+            $applied = @(Get-TestGpEntry -Key 'SOFTWARE\Policies\Fixture' -ValueName 'Simple' -Value '0')
+
+            $rows = Invoke-Resolve -Mdm $mdm -Applied $applied -AdmxIndex (Get-TestIndex)
+            $rows.Count | Should -Be 1
+            $rows[0].Verdict | Should -Be 'Conflict'
+            $rows[0].Note | Should -BeLike '*holds the value of Intune*MDMWinsOverGP is on, but Group Policy applied it anyway*'
+            $rows[0].Note | Should -BeLike '*covers only Policy CSP settings*'
+        }
+
         It 'OverriddenByMdm compares the GPO value with the value the ADMX state means' {
             $mdm = @(Get-TestAdmxPolicy -Name 'Fixture/SimpleSwitch' -Key 'SOFTWARE\Policies\Fixture' -ValueName 'Simple')
             $rows = Invoke-Resolve -Mdm $mdm -Cached @(Get-TestGpEntry -Key 'SOFTWARE\Policies\Fixture' -ValueName 'Simple' -Value '1') -AdmxIndex (Get-TestIndex)

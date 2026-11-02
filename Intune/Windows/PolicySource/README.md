@@ -30,7 +30,10 @@ When both sides set the same thing, one of three things happens:
   `gpresult`'s main list no longer show it. Only `gpresult`'s
   *Setting controlled by a different authority* section does, and that needs a
   domain controller. The GP team sees nothing wrong, and the setting comes back
-  as soon as the Intune policy is removed.
+  as soon as the Intune policy is removed. The switch covers only settings in
+  the Policy CSP. Those of other CSPs, such as BitLocker and Defender, behave
+  as if it were off: a BitLocker value can flip with every Intune sync and
+  Group Policy refresh.
 - **Neither side knows about the other.** Intune's reports compare Intune
   policies with each other, and Group Policy analytics reads GPO backups, not
   what a device received.
@@ -73,7 +76,7 @@ Rows come back in this order:
 
 | Verdict | Meaning |
 | --- | --- |
-| `Conflict` | Group Policy and an MDM both apply it, with different values. For an ADMX-backed MDM setting, the MDM's value is the one its state means (`MdmRegistryValue`). The note says whose value the registry holds. |
+| `Conflict` | Group Policy and an MDM both apply it, with different values. For an ADMX-backed MDM setting, the MDM's value is the one its state means (`MdmRegistryValue`). The note says whose value the registry holds. With `MDMWinsOverGP` on, it also says the switch does not cover this setting, so the value changes with whichever side wrote last: run again after a sync and after `gpupdate` to see it. |
 | `OverriddenByMdm` | A GPO sets it, but Group Policy did not apply it because an MDM sets it too. The note says whether the GPO's value differs from the one in effect. |
 | `NotApplied` | A GPO sets it, Group Policy did not apply it, and no active MDM setting explains why. When a leftover is listed for it, the note says so; otherwise check the Group Policy operational log. |
 | `Both` | Both set it. Intune sends ADMX-backed settings as a state (`Enabled`, `Disabled`, with any data), not as the registry value, and this setting's ADMX definition was not found, so the note compares the GPO's value with the registry instead and says why the definition is missing. |
