@@ -37,6 +37,9 @@ it, one check per step. Running it locally is running CI.
 
 # A subset.
 .\Tools\Invoke-RepositoryCheck.ps1 -Check Analyzer, Compatibility, Scan, Readme
+
+# Only the versions, against the local main rather than origin/main.
+.\Tools\Invoke-RepositoryCheck.ps1 -Check Version -Base main
 ```
 
 | Check | Runs |
@@ -45,6 +48,7 @@ it, one check per step. Running it locally is running CI.
 | `Compatibility` | PSScriptAnalyzer with `PSScriptAnalyzerSettings.WindowsPowerShell.psd1` over every script that declares `#Requires -Version 5.1`. PowerShell 7 only. |
 | `Scan` | `Test-SensitiveContent.ps1` over the working tree, values masked. |
 | `Readme` | Every folder has a `README.md`, except `.git`, `.github`, `.claude` and `.vscode` at the root. |
+| `Version` | Every script whose code changed since `-Base` raised its `Version`, every new script declares one, and every versioned region whose code changed raised its version. See [The Version check](#the-version-check). |
 | `Pester` | Every test under PowerShell 7; under Windows PowerShell, the tests that declare 5.1. |
 | `Parse` | The Windows PowerShell 5.1 parser over every script that declares 5.1. Windows PowerShell only. |
 | `WindowsPowerShell` | From PowerShell 7 on Windows, `Parse` and `Pester` again in `powershell.exe`. |
@@ -63,6 +67,31 @@ CI passes, also fails the run when the Graph helper tests would load a
 `Microsoft.Graph.Authentication` other than the pinned one: they import the
 highest version installed, so a newer copy would silently replace the pin.
 Locally that is a warning.
+
+## The Version check
+
+A script copied out of the repository keeps only its own text, so its
+`Version` under `.NOTES` is how a copy shows whether it is behind. The check
+keeps that number honest. CLAUDE.md has the rule; this is how it is checked.
+
+- **What it compares.** The working tree, uncommitted and untracked files
+  included, with the commit where HEAD left `-Base`: `origin/main` by default.
+  CI checks out two commits and passes `-Base 'HEAD^1'`, which in a pull
+  request is the tip of the branch it merges into and on `main` the commit
+  before.
+- **What counts as code.** The script's tokens without its comments, with line
+  endings evened out. A change to help, comments or the SPDX header needs no
+  new version; a `#Requires` line counts as code.
+- **Scripts.** Every changed `.ps1` whose code changed must declare a higher
+  `Version` than before, and every new one must declare one. Test files and
+  everything under `Templates/` are left out: tests carry no version, and a
+  template's `Version` is where new work starts.
+- **Regions.** Every region whose `#region` line carries a version, such as
+  `#region Graph helpers 1.0.0 - canonical copy in ...`, must raise it when the
+  code inside changes, in any `.ps1`, templates and tests included.
+
+It needs git. A base it cannot find fails the check with the command that
+fetches it.
 
 ## The Claude Code hook
 

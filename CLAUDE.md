@@ -88,6 +88,7 @@ outside my organisation.
   - `Admin consent` — required or not
   - `Licensing` — e.g. Microsoft Intune Plan 1, Microsoft Entra ID P1/P2
   - `Modules` — every module the script depends on
+  - `Version` — raised with every change to the code; see "Versions" below
 
 ## Admin-side and endpoint-side scripts
 
@@ -105,8 +106,9 @@ The Graph plumbing — signing in and verifying scopes, retrying throttled and
 failed requests, following every page — is the `#region Graph helpers` block
 of `Templates/Script-Template.ps1`, carried verbatim by every script under
 `Graph/`. Use it rather than calling `Connect-MgGraph` or looping over
-`Invoke-MgGraphRequest` by hand. Change it only in the template, paste the
-whole region over every copy, and run Pester:
+`Invoke-MgGraphRequest` by hand. Change it only in the template, raise the
+version on its `#region` line, paste the whole region over every copy, raise
+each copy's script `Version`, and run Pester:
 `Templates/Script-Template.Tests.ps1` fails while any copy differs, and names
 the first line that does. Script-specific code stays outside the region.
 
@@ -139,8 +141,29 @@ through the `#region Remediation test harness` block of
 `Templates/Remediation/ExampleSetting.Tests.ps1`, with stand-ins for whatever
 touches the device, and asserts the exit code and output line of every path.
 The harness and the TimeGuard region follow the same rule as the Graph
-helpers: change the canonical copy, paste the whole region over every copy,
-and run Pester, which fails while any copy differs.
+helpers: change the canonical copy, raise its region version, paste the whole
+region over every copy, and run Pester, which fails while any copy differs.
+
+## Versions
+
+A script copied out of the repository keeps nothing but its own text, so the
+`Version` under `.NOTES` is how a copy tells whether it is behind. Raise it
+with every change to the script's code: the last number for a fix, the middle
+one for new behaviour, the first for a change to how it is run. A refactor
+counts too, because nothing can tell it from a fix. Comments, help and the
+SPDX header are not code; `#Requires` lines are. A new script starts at the
+template's `1.0.0`.
+
+A shared region carries its own version on its `#region` line, as in
+`#region TimeGuard 1.0.0 - canonical copy in ...`. When its code changes, raise
+that version in the canonical copy, paste the region over every copy, and
+raise the `Version` of every script that carries it. Test files carry no
+`Version`. Under `Templates/`, a `Version` is where new work starts, so it is
+not raised; the region versions record the changes there.
+
+`Tools/Invoke-RepositoryCheck.ps1 -Check Version` holds both rules against
+the commit where the branch left `origin/main`, uncommitted changes included,
+and CI runs it against the commit before the one under test.
 
 **Declare the version honestly.** `#Requires -Version` is the contract, and CI
 reads it: a script that declares `5.1` is checked for Windows PowerShell
@@ -164,10 +187,10 @@ script genuinely needs it rather than writing 5.1-compatible code out of habit.
 2. `Tools/Invoke-RepositoryCheck.ps1` under `pwsh` on Windows — every check CI
    runs, the same way CI runs it: PSScriptAnalyzer (CI fails on ParseError,
    Error and Warning), Windows PowerShell 5.1 compatibility, the identifier and
-   secret scan, folder READMEs, and Pester, then the 5.1 parser and the 5.1
-   tests in `powershell.exe`. `-Check` runs a subset. The first run in each
-   edition needs `-InstallModule`, because Windows PowerShell and PowerShell 7
-   keep separate modules.
+   secret scan, folder READMEs, versions, and Pester, then the 5.1 parser and
+   the 5.1 tests in `powershell.exe`. `-Check` runs a subset. The first run in
+   each edition needs `-InstallModule`, because Windows PowerShell and
+   PowerShell 7 keep separate modules.
 
 When a script has tests (`<Script>.Tests.ps1` beside it), build
 identifier-shaped test values at run time so the test file passes the scanner

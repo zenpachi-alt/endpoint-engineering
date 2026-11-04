@@ -21,6 +21,13 @@
                        matched values masked.
     Readme             Every folder has a README.md, except .git, .github,
                        .claude and .vscode.
+    Version            Since -Base: every script whose code changed declares a
+                       higher Version under .NOTES, every new script declares
+                       one, and every region whose '#region' line carries a
+                       version raises it when its code changes. Comments are
+                       not code; #Requires lines are. Test files and Templates/
+                       are left out of the script rule, not the region rule.
+                       Needs git.
     Pester             Under PowerShell 7, every *.Tests.ps1. Under Windows
                        PowerShell, the tests that declare #Requires -Version 5.1.
     Parse              Every script that declares 5.1, through the Windows
@@ -51,6 +58,12 @@
 
 .PARAMETER Path
     The repository to check. Defaults to the clone this script is in.
+
+.PARAMETER Base
+    The commit or branch the Version check compares with. It compares the
+    working tree with the commit where HEAD left this one, so uncommitted
+    changes count. Defaults to origin/main. CI passes HEAD^1: in a pull
+    request, the tip of the branch it merges into; on main, the commit before.
 
 .PARAMETER InstallModule
     Install a pinned module version that is missing, for the current user,
@@ -83,10 +96,16 @@
 
     Installs any pinned module that is missing, then runs every check.
 
+.EXAMPLE
+    .\Tools\Invoke-RepositoryCheck.ps1 -Check Version -Base main
+
+    Which scripts changed since this branch left the local main, and whether
+    each raised its Version.
+
 .NOTES
     Author        : Tomasz Pietryka
-    Version       : 1.0.0
-    Last updated  : 2026-10-05
+    Version       : 1.1.0
+    Last updated  : 2026-11-04
 
     PowerShell    : 5.1 or later. CI runs Parse and Pester under Windows
                     PowerShell 5.1, and every check under PowerShell 7.
@@ -96,7 +115,8 @@
     Modules       : PSScriptAnalyzer and Pester, at the versions pinned in
                     $PinnedModule. Microsoft.Graph.Authentication at its pinned
                     version lets the Graph helper tests run against the real
-                    SDK; without it, that part of them is skipped.
+                    SDK; without it, that part of them is skipped. The Version
+                    check needs git on the PATH.
     Role required : None.
 
     Exit codes    : 0 every selected check passed.
@@ -108,7 +128,7 @@
 [OutputType([string])]
 param (
     [Parameter()]
-    [ValidateSet('Analyzer', 'Compatibility', 'Scan', 'Readme', 'Pester', 'Parse', 'WindowsPowerShell')]
+    [ValidateSet('Analyzer', 'Compatibility', 'Scan', 'Readme', 'Version', 'Pester', 'Parse', 'WindowsPowerShell')]
     [string[]]$Check,
 
     [Parameter()]
@@ -117,6 +137,10 @@ param (
             else { throw "No folder at '$_'." }
         })]
     [string]$Path = (Split-Path -Path $PSScriptRoot -Parent),
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$Base = 'origin/main',
 
     [Parameter()]
     [switch]$InstallModule,
@@ -145,7 +169,7 @@ $PinnedModule = @{
 }
 
 # The order checks run in: the quick ones first.
-$CheckOrder = @('Analyzer', 'Compatibility', 'Scan', 'Readme', 'Pester', 'Parse', 'WindowsPowerShell')
+$CheckOrder = @('Analyzer', 'Compatibility', 'Scan', 'Readme', 'Version', 'Pester', 'Parse', 'WindowsPowerShell')
 
 $IsDesktop = $PSVersionTable.PSEdition -eq 'Desktop'
 $OnWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
@@ -154,7 +178,7 @@ $Results = [System.Collections.Generic.List[object]]::new()
 
 # What the checks read of the parameters, gathered at script level, where PSScriptAnalyzer
 # sees them used: it does not follow a parameter into the functions that read it.
-$Options = @{ InstallModule = [bool]$InstallModule; Strict = [bool]$Strict; PesterOutput = $PesterOutput }
+$Options = @{ InstallModule = [bool]$InstallModule; Strict = [bool]$Strict; PesterOutput = $PesterOutput; Base = $Base }
 
 function Add-CheckResult {
     [CmdletBinding()]
@@ -319,6 +343,171 @@ function Invoke-ReadmeCheck {
     Add-CheckResult -Name Readme -Result Passed -Detail 'Every folder has a README.md'
 }
 
+function Invoke-Git {
+    # Git's standard output, one string per line. Git also writes progress and warnings to
+    # standard error, which Windows PowerShell turns into error records once redirected, and
+    # 'Stop' would throw on the first of them. Here the exit code decides instead.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param ([Parameter(Mandatory)] [string[]]$Argument)
+
+    $ErrorActionPreference = 'Continue'
+    $all = @(& git -C $Path @Argument 2>&1)
+    $code = $LASTEXITCODE
+    if ($code -ne 0) {
+        $stderr = @($all | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { $_.ToString() })
+        throw ('git {0} exited {1}: {2}' -f ($Argument -join ' '), $code, ($stderr -join ' '))
+    }
+    $all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ }
+}
+
+function Get-ScriptCode {
+    # A script's tokens without its comments, one per line: what the Version check compares.
+    # Line endings are evened out first, so a Windows checkout matches the LF in the repository.
+    # #Requires lines are comments to the tokenizer, but a contract to PowerShell, so they stay.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param ([Parameter(Mandatory)] [AllowEmptyString()] [string]$Text)
+
+    $tokens = $null
+    $parseErrors = $null
+    $null = [System.Management.Automation.Language.Parser]::ParseInput(($Text -replace '\r\n', "`n"), [ref]$tokens, [ref]$parseErrors)
+    @($tokens | Where-Object {
+            ($_.Kind -ne 'Comment' -or $_.Text -match '^#Requires\b') -and
+            $_.Kind -notin 'NewLine', 'LineContinuation', 'EndOfInput'
+        } | ForEach-Object { $_.Text }) -join "`n"
+}
+
+function Get-DeclaredVersion {
+    # The 'Version : x.y.z' line under .NOTES, or $null.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param ([Parameter(Mandatory)] [AllowEmptyString()] [string]$Text)
+
+    $match = [regex]::Match($Text, '(?m)^\s*Version\s*:\s*(\S+)')
+    if ($match.Success) { $match.Groups[1].Value } else { $null }
+}
+
+function Get-VersionedRegion {
+    # Every region whose '#region' line carries a version, as in
+    # '#region TimeGuard 1.0.0 - canonical copy in ...': name -> version and code.
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param ([Parameter(Mandatory)] [AllowEmptyString()] [string]$Text)
+
+    $regions = @{}
+    $lines = @($Text -split '\r?\n')
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $header = [regex]::Match($lines[$i], '^\s*#region (?<name>.+?) (?<version>\d+(\.\d+){1,3}) - ')
+        if (-not $header.Success) { continue }
+        $name = $header.Groups['name'].Value
+        $end = '^\s*#endregion {0}\s*$' -f [regex]::Escape($name)
+        for ($j = $i + 1; $j -lt $lines.Count; $j++) {
+            if ($lines[$j] -cmatch $end) {
+                $regions[$name] = @{
+                    Version = $header.Groups['version'].Value
+                    Code    = Get-ScriptCode -Text ($lines[$i..$j] -join "`n")
+                }
+                break
+            }
+        }
+    }
+    $regions
+}
+
+function Test-VersionRaised {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param ([AllowNull()] [string]$Old, [AllowNull()] [string]$New)
+
+    $oldVersion = $null
+    $newVersion = $null
+    if ([version]::TryParse($Old, [ref]$oldVersion) -and [version]::TryParse($New, [ref]$newVersion)) {
+        return $newVersion -gt $oldVersion
+    }
+    $New -ne $Old
+}
+
+function Invoke-VersionCheck {
+    [CmdletBinding()]
+    param ()
+
+    try { $null = Get-Command -Name git -CommandType Application -ErrorAction Stop }
+    catch { throw 'The Version check needs git on the PATH.' }
+
+    $root = @(Invoke-Git -Argument 'rev-parse', '--show-toplevel')[0]
+    try { $baseCommit = @(Invoke-Git -Argument 'merge-base', 'HEAD', $Options.Base)[0] }
+    catch {
+        throw ("Cannot find where HEAD left '{0}'. Fetch it (git fetch origin), or name another commit with -Base. {1}" -f
+            $Options.Base, $_.Exception.Message)
+    }
+    $since = '{0} ({1})' -f $Options.Base, $baseCommit.Substring(0, 7)
+
+    # The working tree against the base, so uncommitted changes count, and new files not yet
+    # added. A line is 'M<tab>path', 'A<tab>path' or 'R100<tab>old<tab>new'.
+    $changed = [System.Collections.Generic.List[object]]::new()
+    foreach ($line in @(Invoke-Git -Argument 'diff', '--name-status', '--find-renames', $baseCommit, '--')) {
+        $fields = $line -split "`t"
+        if ($fields[-1] -notlike '*.ps1') { continue }
+        $status = $fields[0].Substring(0, 1)
+        if ($status -in 'M', 'R') { $changed.Add([pscustomobject]@{ Old = $fields[1]; New = $fields[-1] }) }
+        if ($status -eq 'A') { $changed.Add([pscustomobject]@{ Old = $null; New = $fields[-1] }) }
+    }
+    foreach ($file in @(Invoke-Git -Argument 'ls-files', '--others', '--exclude-standard', '--full-name', '--', '*.ps1')) {
+        $changed.Add([pscustomobject]@{ Old = $null; New = $file })
+    }
+
+    $failures = [System.Collections.Generic.List[string]]::new()
+    $raised = 0
+    foreach ($entry in $changed) {
+        $new = [System.IO.File]::ReadAllText((Join-Path -Path $root -ChildPath $entry.New))
+        $old = if ($entry.Old) { @(Invoke-Git -Argument 'show', ('{0}:{1}' -f $baseCommit, $entry.Old)) -join "`n" } else { $null }
+
+        # The script's own Version. Test files are not copied out and carry none. In
+        # Templates/ a Version is where new work starts, and the shared blocks there are
+        # held by the region rule below instead.
+        if ($entry.New -notlike '*.Tests.ps1' -and $entry.New -notlike 'Templates/*') {
+            $newVersion = Get-DeclaredVersion -Text $new
+            if ($null -eq $old) {
+                if ($null -eq $newVersion) { $failures.Add(('{0}: new, and declares no Version under .NOTES' -f $entry.New)) }
+            }
+            elseif ((Get-ScriptCode -Text $old) -cne (Get-ScriptCode -Text $new)) {
+                $oldVersion = Get-DeclaredVersion -Text $old
+                if (Test-VersionRaised -Old $oldVersion -New $newVersion) { $raised++ }
+                else {
+                    $failures.Add(('{0}: the code changed, but Version is {1}, and was {2}' -f $entry.New,
+                            $(if ($newVersion) { $newVersion } else { 'missing' }), $(if ($oldVersion) { $oldVersion } else { 'missing' })))
+                }
+            }
+        }
+
+        # Every versioned region, in any script: a copy says which revision of the block it holds.
+        if ($null -eq $old) { continue }
+        $oldRegions = Get-VersionedRegion -Text $old
+        $newRegions = Get-VersionedRegion -Text $new
+        foreach ($name in @($newRegions.Keys | Sort-Object)) {
+            if (-not $oldRegions.ContainsKey($name)) { continue }
+            if ($oldRegions[$name].Code -ceq $newRegions[$name].Code) { continue }
+            if (-not (Test-VersionRaised -Old $oldRegions[$name].Version -New $newRegions[$name].Version)) {
+                $failures.Add(('{0}: the code of the {1} region changed, but its version is {2}, and was {3}' -f $entry.New, $name,
+                        $newRegions[$name].Version, $oldRegions[$name].Version))
+            }
+        }
+    }
+
+    if ($failures.Count -gt 0) {
+        $failures | ForEach-Object { Write-Output $_ }
+        Write-Output (('Compared with {0}. Raise the version: the last number for a fix, the middle one for new ' +
+                'behaviour. A change to a shared region raises the region''s version and the Version of every ' +
+                'script that carries it.') -f $since)
+        Add-CheckResult -Name Version -Result Failed -Detail ('{0} version(s) to raise or declare' -f $failures.Count)
+        return
+    }
+    $detail = if ($raised -eq 0) { 'No script''s code changed since {0}' -f $since }
+    else { '{0} script(s) changed since {1}, each with a higher Version' -f $raised, $since }
+    Add-CheckResult -Name Version -Result Passed -Detail $detail
+}
+
 function Invoke-PesterCheck {
     [CmdletBinding()]
     param ()
@@ -442,6 +631,7 @@ foreach ($name in @($CheckOrder | Where-Object { $_ -in $selected })) {
             'Compatibility' { Invoke-CompatibilityCheck }
             'Scan' { Invoke-ScanCheck }
             'Readme' { Invoke-ReadmeCheck }
+            'Version' { Invoke-VersionCheck }
             'Pester' { Invoke-PesterCheck }
             'Parse' { Invoke-ParseCheck }
             'WindowsPowerShell' { Invoke-WindowsPowerShellCheck }

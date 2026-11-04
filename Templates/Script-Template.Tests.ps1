@@ -16,7 +16,8 @@
 
     Copies: every script under Graph/, and any other script that carries the
     Graph helpers region, must hold copies of the Graph module and Graph
-    helpers regions identical to the template's. This is what keeps one
+    helpers regions identical to the template's, from the '#region' line with
+    the region's version to the '#endregion' line. This is what keeps one
     implementation across scripts that each run on their own. A failure names
     the file and the first line that differs.
 
@@ -74,7 +75,7 @@ BeforeDiscovery {
             Where-Object { $_.FullName -ne $templatePath -and $_.Name -notlike '*.Tests.ps1' } |
             Where-Object {
                 $_.FullName.StartsWith($graphRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
-                (Get-Content -LiteralPath $_.FullName) -contains '#region Graph helpers'
+                @(Get-Content -LiteralPath $_.FullName) -cmatch '^#region Graph helpers\b'
             } |
             ForEach-Object {
                 @{
@@ -96,12 +97,13 @@ BeforeAll {
     $script:TemplatePath = Join-Path -Path $PSScriptRoot -ChildPath 'Script-Template.ps1'
 
     function Get-CopiedRegion {
-        # The lines from '#region <Name>' to '#endregion <Name>', or $null
-        # unless the file holds exactly one such block.
+        # The lines from '#region <Name> <version> - ...' to '#endregion <Name>',
+        # or $null unless the file holds exactly one such block. The '#region'
+        # line is compared with the rest, so a copy carries the region's version.
         param ([string]$Path, [string]$Name = 'Graph helpers')
 
         $lines = @((Get-Content -LiteralPath $Path -Raw) -split '\r?\n')
-        $starts = @(for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -ceq "#region $Name") { $i } })
+        $starts = @(for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -cmatch "^#region $Name\b") { $i } })
         $ends = @(for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -ceq "#endregion $Name") { $i } })
 
         if ($starts.Count -ne 1 -or $ends.Count -ne 1 -or $ends[0] -le $starts[0]) { return $null }
@@ -845,7 +847,7 @@ try {
     Import-Module -Name Microsoft.Graph.Authentication -MinimumVersion 2.0.0
 
     $lines = @((Get-Content -LiteralPath $TemplatePath -Raw) -split '\r?\n')
-    $first = [array]::IndexOf($lines, '#region Graph helpers')
+    $first = @(for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -cmatch '^#region Graph helpers\b') { $i } })[0]
     $last = [array]::IndexOf($lines, '#endregion Graph helpers')
     $regionText = $lines[$first..$last] -join "`n"
     . ([scriptblock]::Create($regionText))

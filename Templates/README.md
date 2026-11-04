@@ -58,7 +58,12 @@ The region is copied rather than loaded from a shared file so that each script
 still runs when copied out on its own. The copies cannot drift apart:
 `Script-Template.Tests.ps1` fails while any copy differs from the template's,
 and names the first line that does. To change a helper, edit the template,
-paste the whole region over every copy, and run Pester.
+raise the version on the region's `#region` line, paste the whole region over
+every copy, raise the `Version` of every script that carries it, and run
+Pester. The `#region` line is part of the copy, so each script records which
+revision of the helpers it holds. The repository's Version check fails until
+both versions are raised. The template's own `Version` is where a new script
+starts, and stays as it is.
 
 The tests also exercise the helpers against stand-ins for the SDK, under both
 Windows PowerShell 5.1 and PowerShell 7, and — where

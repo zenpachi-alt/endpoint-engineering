@@ -78,6 +78,9 @@ Intune nor a tenant.
    Get-Help .\Get-ManagedDeviceInventory.ps1 -Full
    ```
 
+   The `Version` under its notes rises with every change to the script's code,
+   so a copy you kept can be compared with the one here.
+
 4. **Rehearse before you change anything.** Run anything that writes with
    `-WhatIf` first, and against a test tenant or test device before production.
 
@@ -141,6 +144,7 @@ failure:
 | Windows PowerShell 5.1 compatibility | Scripts that declare `#Requires -Version 5.1` are checked against it with `PSScriptAnalyzerSettings.WindowsPowerShell.psd1`, and parsed by the 5.1 parser. Everything else is free to use PowerShell 7. | Linux, PowerShell 7; Windows, 5.1 parser |
 | Sensitive content scan | No tenant identifiers or credential material, with matched values masked so the log stays safe to publish. | Linux |
 | Folder READMEs | Every folder documents itself. | Linux |
+| Versions | A script whose code changed raises its `Version`, a new one declares one, and a shared block whose code changed raises the version on its `#region` line. Comments do not count. | Linux |
 | Pester | Every `*.Tests.ps1` passes under PowerShell 7, and the tests that declare 5.1 pass under Windows PowerShell 5.1 too. | Linux and Windows, PowerShell 7; Windows, 5.1 |
 
 Besides each script's own behaviour, the tests hold the rules the repository

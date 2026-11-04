@@ -78,8 +78,8 @@
 
 .NOTES
     Author        : Tomasz Pietryka
-    Version       : 1.0.0
-    Last updated  : 2026-09-27
+    Version       : 1.1.0
+    Last updated  : 2026-11-04
 
     PowerShell    : 5.1 or 7. No PowerShell 7 syntax is used.
     Graph scopes  : DeviceManagementManagedDevices.Read.All
@@ -140,7 +140,7 @@ param (
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-#region Graph module
+#region Graph module 1.0.0 - canonical copy in Templates/Script-Template.ps1
 # Identical in every script under Graph/, like the Graph helpers below. The
 # master copy is the one in Templates/Script-Template.ps1, and
 # Templates/Script-Template.Tests.ps1 fails while any copy differs.
@@ -188,7 +188,7 @@ $ConnectionOpenedHere = $false
 # Entra ID keeps at most 200 recovery keys per device.
 $KeyCountWarningThreshold = 150
 
-#region Graph helpers
+#region Graph helpers 1.0.0 - canonical copy in Templates/Script-Template.ps1
 # Shared by every script under Graph/ and identical in each, so that any one of
 # them still runs when copied out on its own. The master copy is the one in
 # Templates/Script-Template.ps1: change it there, paste the whole region over
