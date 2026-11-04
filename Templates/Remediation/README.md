@@ -153,7 +153,8 @@ rules can be checked without a device by dot-sourcing `TimeGuard.ps1`.
 `TimeGuard.Tests.ps1` fails while any script's copy of the region differs from
 `TimeGuard.ps1`, version line included, and names the first line that does. To
 change TimeGuard, edit `TimeGuard.ps1`, raise the version on its `#region`
-line, paste the whole region over every copy, and run Pester.
+line, paste the whole region over every copy, raise the `Version` of every
+script that carries it, and run Pester.
 
 ## Tests
 
@@ -196,8 +197,9 @@ are skipped outside Windows.
 
 The harness is the `#region Remediation test harness` block of
 `ExampleSetting.Tests.ps1`. Package tests carry an unchanged copy, and
-`ExampleSetting.Tests.ps1` fails while any copy differs. Change it there, paste
-the region over every copy, and run Pester.
+`ExampleSetting.Tests.ps1` fails while any copy differs. Change it there, raise
+the version on its `#region` line, paste the region over every copy, and run
+Pester.
 [`SystemFileHealth.Tests.ps1`](../../Intune/Windows/Remediations/SystemFileHealth/SystemFileHealth.Tests.ps1)
 is the fullest example.
 

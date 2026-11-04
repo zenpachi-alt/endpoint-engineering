@@ -242,7 +242,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $InformationPreference = 'Continue'
 
-#region Graph module
+#region Graph module 1.0.0 - canonical copy in Templates/Script-Template.ps1
 # Identical in every script under Graph/, like the Graph helpers below. The
 # master copy is the one in Templates/Script-Template.ps1, and
 # Templates/Script-Template.Tests.ps1 fails while any copy differs.
@@ -285,7 +285,7 @@ $ConnectionOpenedHere = $false
 # the main block, so the session is closed first.
 $ExitCode = 0
 
-#region Graph helpers
+#region Graph helpers 1.0.0 - canonical copy in Templates/Script-Template.ps1
 # Shared by every script under Graph/ and identical in each, so that any one of
 # them still runs when copied out on its own. The master copy is the one in
 # Templates/Script-Template.ps1: change it there, paste the whole region over
