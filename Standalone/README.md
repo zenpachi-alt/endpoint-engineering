@@ -61,7 +61,7 @@ to share all of it; the recipient loses no diagnostic value, only identity.
 | --- | --- | --- |
 | Private keys, JWTs, bearer tokens, `password=` style values | `[REDACTED-JWT]`, `[REDACTED]` | No, never stored |
 | E-mail addresses and UPNs | `user001@example.com` | Yes |
-| GUIDs | `00000000-0000-0000-0000-000000000001` | Yes |
+| GUIDs, also several written back to back | `00000000-0000-0000-0000-000000000001` | Yes |
 | SIDs, MAC addresses, SHA-1 thumbprints | `S-1-5-21-0-0-0-1001`, `00-00-5E-00-53-01`, `THUMBPRINT-001` | Yes |
 | Tenant names in `*.onmicrosoft.com`, `*.sharepoint.com` | `tenant001` | Yes |
 | Configured domains, and every host under them | `corp001.example`, `host001.corp001.example` | Yes |

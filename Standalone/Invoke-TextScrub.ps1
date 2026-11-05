@@ -20,7 +20,8 @@
 
     Replaced, in this order:
         private keys, JWTs, bearer tokens, password=... style values (one way)
-        e-mail addresses and UPNs, GUIDs, SIDs, MAC addresses, SHA-1 thumbprints
+        e-mail addresses and UPNs, GUIDs (also several written back to back),
+        SIDs, MAC addresses, SHA-1 thumbprints
         tenant names in *.onmicrosoft.com and *.sharepoint.com
         configured domains and every host name under them
         UNC server names and user profile folder names
@@ -137,8 +138,8 @@
 
 .NOTES
     Author        : Tomasz Pietryka
-    Version       : 1.0.1
-    Last updated  : 2026-09-23
+    Version       : 1.0.2
+    Last updated  : 2026-11-05
 
     PowerShell    : 7.0 or later. A workstation utility that is never deployed
                     through Intune, so it is not held to Windows PowerShell 5.1.
@@ -260,6 +261,8 @@ begin {
     $Capacity = @{ MAC = 256; IPV4 = 762 }
 
     $Octet = '(?:25[0-5]|2[0-4]\d|1?\d?\d)'
+    $GuidShape = '[0-9A-F]{8}-(?:[0-9A-F]{4}-){3}[0-9A-F]{12}'
+    $WholeGuid = [regex]::new('^' + $GuidShape + '$', $RxOptions)
     $Rx = @{
         PrivateKey  = '-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----'
         Jwt         = 'eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*'
@@ -268,7 +271,10 @@ begin {
                       'access_token|refresh_token|sas_token|sig)\b["'']?\s*[=:]\s*["'']?)' +
                       '(?![\$\(\[\{@<\s])[^\s"'';&,]{6,}'
         Email       = '\b[A-Z0-9][A-Z0-9._%+''-]*@[A-Z0-9-]+(?:\.[A-Z0-9-]+)+\b'
-        Guid        = '(?<![0-9A-F])[0-9A-F]{8}-(?:[0-9A-F]{4}-){3}[0-9A-F]{12}(?![0-9A-F])'
+        # One GUID per match, alone or among GUIDs written back to back with nothing
+        # between them, as Intune's Remediations export does. The run of hex around it
+        # must be whole GUIDs, so part of a longer hex string is never taken for one.
+        Guid        = "(?<=(?:^|[^0-9A-F])(?:$GuidShape)*)$GuidShape(?=(?:$GuidShape)*(?![0-9A-F]))"
         Sid         = '\bS-1-(?:5-21|12-1)(?:-\d+){3,5}\b'
         Mac         = '(?<![0-9A-F:-])(?:[0-9A-F]{2}[:-]){5}[0-9A-F]{2}(?![0-9A-F:-])'
         Thumbprint  = '(?<![0-9A-F])[0-9A-F]{40}(?![0-9A-F])'
@@ -469,7 +475,9 @@ begin {
         # around the range is searched, cut out with Substring: Regex.Match(text, start,
         # length) costs time in proportion to the whole text, thousands of times slower
         # on a large file. Word boundaries are checked here against the full text,
-        # because a lookbehind cannot see past the start of the window.
+        # because a lookbehind cannot see past the start of the window. A GUID placeholder
+        # next to another GUID, with nothing between them, counts as bounded: that is how
+        # the GUID step leaves GUIDs written back to back.
         param ([string]$Text, [int]$Index, [int]$Length, [hashtable]$Guard)
         $from = [Math]::Max(0, $Index - $Guard.MaxLength)
         $to = [Math]::Min($Text.Length, $Index + $Length + $Guard.MaxLength)
@@ -477,10 +485,13 @@ begin {
         while ($probe.Success) {
             $start = $from + $probe.Index
             $end = $start + $probe.Length
-            if ($start -lt $Index + $Length -and $end -gt $Index -and
-                ($start -eq 0 -or $Text[$start - 1] -notmatch '[A-Za-z0-9]') -and
-                ($end -eq $Text.Length -or $Text[$end] -notmatch '[A-Za-z0-9]')) {
-                return $true
+            if ($start -lt $Index + $Length -and $end -gt $Index) {
+                $isGuid = $WholeGuid.IsMatch($probe.Value)
+                $startBounded = $start -eq 0 -or $Text[$start - 1] -notmatch '[A-Za-z0-9]' -or
+                    ($isGuid -and $start -ge 36 -and $WholeGuid.IsMatch($Text.Substring($start - 36, 36)))
+                $endBounded = $end -eq $Text.Length -or $Text[$end] -notmatch '[A-Za-z0-9]' -or
+                    ($isGuid -and $end + 36 -le $Text.Length -and $WholeGuid.IsMatch($Text.Substring($end, 36)))
+                if ($startBounded -and $endBounded) { return $true }
             }
             $probe = $probe.NextMatch()
         }
@@ -579,6 +590,17 @@ begin {
     function Invoke-Restore {
         param ([string]$Text)
         if ($Map.Issued.Count -eq 0) { return $Text }
+
+        # GUID placeholders first, found the way the scrub finds GUIDs: written back to
+        # back they have no word boundary between them for the pattern below.
+        $Text = Invoke-Replace -Text $Text -Pattern $Rx.Guid -Evaluator {
+            param($m)
+            $original = $Map.Issued[$m.Value.ToLowerInvariant()]
+            if ($null -eq $original) { return $m.Value }
+            $Run.Counts['RESTORED'] = [int]$Run.Counts['RESTORED'] + 1
+            $original
+        }
+
         $pattern = '(?<![A-Z0-9])' + (Get-PlaceholderPattern) + '(?![A-Z0-9])'
         Invoke-Replace -Text $Text -Pattern $pattern -Evaluator {
             param($m)
