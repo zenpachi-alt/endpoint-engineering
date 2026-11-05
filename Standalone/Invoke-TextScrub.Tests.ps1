@@ -87,6 +87,19 @@ Describe 'Invoke-TextScrub' {
             [IO.File]::ReadAllText($restored) | Should -BeExactly $original
         }
 
+        It 'restores GUIDs written back to back' {
+            $first, $second = [guid]::NewGuid(), [guid]::NewGuid()
+            $original = "key $first$second`ndevice $second"
+            $data = Get-DataDirectoryPath
+
+            $scrubbed = (Invoke-UnderTest @{ DataDirectory = $data; SkipLocalIdentity = $true } -InputText $original).Output -join "`n"
+            $scrubbed | Should -Not -Match "$first|$second"
+            $restored = Invoke-UnderTest @{ DataDirectory = $data; Restore = $true } -InputText $scrubbed
+
+            $restored.Output -join "`n" | Should -BeExactly $original
+            $restored.Warnings -join "`n" | Should -Not -Match 'nothing was restored'
+        }
+
         It 'reuses placeholders on a second run without growing the map' {
             $data = Get-DataDirectoryPath
             $text = "Device $([guid]::NewGuid()) and alice@fabrikam.com"
@@ -112,7 +125,8 @@ Describe 'Invoke-TextScrub' {
         It 'leaves already scrubbed text unchanged' {
             $data = Get-DataDirectoryPath
             $parameters = @{ DataDirectory = $data; SkipLocalIdentity = $true; Domain = 'fabrikam.com' }
-            $once = (Invoke-UnderTest $parameters -InputText "srv01.corp.fabrikam.com $([guid]::NewGuid()) carol@fabrikam.com").Output
+            $joined = -join (1..3 | ForEach-Object { [guid]::NewGuid() })
+            $once = (Invoke-UnderTest $parameters -InputText "srv01.corp.fabrikam.com $([guid]::NewGuid()) carol@fabrikam.com $joined").Output
             $twice = (Invoke-UnderTest $parameters -InputText $once).Output
 
             $twice | Should -BeExactly $once
@@ -141,6 +155,46 @@ Describe 'Invoke-TextScrub' {
             $output = (Invoke-UnderTest @{ DataDirectory = (Get-DataDirectoryPath); SkipLocalIdentity = $true } -InputText "app $graph").Output
 
             $output | Should -BeExactly "app $graph"
+        }
+
+        It 'scrubs <Count> GUIDs written back to back, each on its own' -TestCases @(
+            @{ Count = 2 }
+            @{ Count = 3 }
+        ) {
+            # As in the UniqueKustoKey column of an Intune Remediations export.
+            $joined = -join (1..$Count | ForEach-Object { [guid]::NewGuid() })
+            $expected = -join (1..$Count | ForEach-Object { '00000000-0000-0000-0000-{0:d12}' -f $_ })
+            $output = (Invoke-UnderTest @{ DataDirectory = (Get-DataDirectoryPath); SkipLocalIdentity = $true } -InputText "key $joined").Output
+
+            $output | Should -BeExactly "key $expected"
+        }
+
+        It 'gives a GUID in a run the placeholder it has on its own, and keeps known IDs readable there' {
+            $graph = '00000003-0000-0000-c000-000000000000'
+            $first, $second = [guid]::NewGuid(), [guid]::NewGuid()
+            $output = (Invoke-UnderTest @{ DataDirectory = (Get-DataDirectoryPath); SkipLocalIdentity = $true } `
+                    -InputText "device $second key $first$second$graph").Output
+
+            $output | Should -BeExactly ('device {1} key {0}{1}{2}' -f
+                '00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', $graph)
+        }
+
+        It 'leaves alone hex that is not made of whole GUIDs' {
+            $guid = [guid]::NewGuid().ToString()
+            $text = 'a{0} {0}f {1}{0}{2} {3}' -f $guid, 'b', $guid.Substring(0, 8), [guid]::NewGuid().ToString('N')
+            $result = Invoke-UnderTest @{ DataDirectory = (Get-DataDirectoryPath); SkipLocalIdentity = $true } -InputText $text
+
+            $result.Output | Should -BeExactly $text
+            $result.ExitCode | Should -Be 0
+        }
+
+        It 'does not let a later step rewrite a placeholder inside a run of GUIDs' {
+            # The literal term matches the digits between the dashes of a GUID placeholder.
+            $joined = -join (1..2 | ForEach-Object { [guid]::NewGuid() })
+            $output = (Invoke-UnderTest @{ DataDirectory = (Get-DataDirectoryPath); SkipLocalIdentity = $true; LiteralTerm = '0000' } `
+                    -InputText "key $joined").Output
+
+            $output | Should -BeExactly 'key 00000000-0000-0000-0000-00000000000100000000-0000-0000-0000-000000000002'
         }
     }
 
