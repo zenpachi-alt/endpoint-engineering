@@ -188,7 +188,9 @@ value against the registry, and a match by key, with a note saying why.
 Ingested files: Microsoft documents that Windows keeps a copy on disk but not
 where. The script looks for ADMX content, whatever the file is called, under
 `%ProgramData%\Microsoft\PolicyManager*` and in PolicyManager's `AdmxInstalled`
-key, and the log says how many it found.
+key, and the log says how many it found and how many it could not read, and
+why. Some copies are UTF-16 files whose first line still says `utf-8`; the
+script reads them as UTF-16.
 
 Reading every ADMX file and its ADML takes a few seconds in Windows PowerShell
 5.1. They are read on every run, not cached, so the result always matches the

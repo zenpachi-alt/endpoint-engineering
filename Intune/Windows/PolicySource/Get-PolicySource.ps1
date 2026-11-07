@@ -130,8 +130,8 @@
 
 .NOTES
     Author        : Tomasz Pietryka
-    Version       : 1.2.1
-    Last updated  : 2026-11-02
+    Version       : 1.2.2
+    Last updated  : 2026-11-07
 
     PowerShell    : Windows PowerShell 5.1. It runs on the device, where
                     PowerShell 7 cannot be assumed.
@@ -284,6 +284,32 @@ function Write-LogEntry {
     }
 
     Write-Verbose $line
+}
+
+function Get-ReadFailureReason {
+    <#
+        .SYNOPSIS
+            Why a read failed, in words that hold no path: the type and HRESULT
+            of the innermost exception, and for an XML error its message, which
+            names a line and position.
+
+        .DESCRIPTION
+            A .NET method called from PowerShell wraps whatever it throws in a
+            MethodInvocationException, so the outer type says nothing. The
+            messages of file errors carry the path, which under PolicyManager
+            includes enrollment IDs, so only an XML error's message is kept.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param (
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $base = $ErrorRecord.Exception.GetBaseException()
+    $reason = '{0} 0x{1:X8}' -f $base.GetType().Name, $base.HResult
+    if ($base -is [System.Xml.XmlException]) { $reason = '{0}: {1}' -f $reason, $base.Message }
+    $reason
 }
 
 function Test-Elevated {
@@ -1004,6 +1030,14 @@ function Get-IngestedAdmxDocument {
             Microsoft documents that an ingested file is kept on disk but not
             where, so a file counts by its content, not its name or extension.
             Folders that cannot be read are logged and skipped.
+
+            Windows keeps some copies as UTF-16 under a declaration that still
+            says utf-8. XmlDocument.Load follows the declaration and reads the
+            rest of the file as UTF-8, so such a copy is decoded first and
+            parsed as a string, which has no encoding to switch.
+
+            A copy that looks like ADMX but cannot be parsed is logged and
+            returned with no Document, so the caller can count it.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1033,7 +1067,7 @@ function Get-IngestedAdmxDocument {
                 $files = [IO.Directory]::GetFiles($folder)
             }
             catch {
-                Write-LogEntry -Message "Ingested ADMX: could not list a folder under $start ($($_.Exception.GetType().Name)); it is skipped." -Level WARN
+                Write-LogEntry -Message "Ingested ADMX: could not list a folder under $start ($(Get-ReadFailureReason -ErrorRecord $_)); it is skipped." -Level WARN
                 continue
             }
             foreach ($file in $files) {
@@ -1041,6 +1075,7 @@ function Get-IngestedAdmxDocument {
                     Write-LogEntry -Message "Ingested ADMX: stopped after $MaxFiles files under $start." -Level WARN
                     return
                 }
+                $isAdmx = $false
                 try {
                     $stream = [IO.File]::OpenRead($file)
                     try {
@@ -1050,14 +1085,20 @@ function Get-IngestedAdmxDocument {
                     finally {
                         $stream.Dispose()
                     }
-                    $text = [Text.Encoding]::UTF8.GetString($head, 0, $read)
-                    if (-not (Test-AdmxText -Text $text) -and -not (Test-AdmxText -Text ([Text.Encoding]::Unicode.GetString($head, 0, $read)))) { continue }
+                    $wide = $false
+                    if (-not (Test-AdmxText -Text ([Text.Encoding]::UTF8.GetString($head, 0, $read)))) {
+                        if (-not (Test-AdmxText -Text ([Text.Encoding]::Unicode.GetString($head, 0, $read)))) { continue }
+                        $wide = $true
+                    }
+                    $isAdmx = $true
                     $xml = New-Object -TypeName System.Xml.XmlDocument
-                    $xml.Load($file)
+                    if ($wide) { $xml.LoadXml([IO.File]::ReadAllText($file, [Text.Encoding]::Unicode)) }
+                    else { $xml.Load($file) }
                     [pscustomobject]@{ Document = $xml; Origin = 'File' }
                 }
                 catch {
-                    Write-LogEntry -Message "Ingested ADMX: a file under $start could not be read ($($_.Exception.GetType().Name)); it is skipped." -Level WARN
+                    Write-LogEntry -Message "Ingested ADMX: a file under $start could not be read ($(Get-ReadFailureReason -ErrorRecord $_)); it is skipped." -Level WARN
+                    if ($isAdmx) { [pscustomobject]@{ Document = $null; Origin = 'File' } }
                 }
             }
         }
@@ -1065,6 +1106,7 @@ function Get-IngestedAdmxDocument {
 
     if ($null -eq $Root) { return }
     foreach ($value in @(Get-RegistryValueLocation -Root $Root -Path "$PolicyManagerPath\AdmxInstalled" -MaxKeys 5000)) {
+        $isAdmx = $false
         try {
             $key = $Root.OpenSubKey($value.Key)
             if ($null -eq $key) { continue }
@@ -1075,12 +1117,14 @@ function Get-IngestedAdmxDocument {
                 $key.Dispose()
             }
             if ($data -isnot [string] -or -not (Test-AdmxText -Text $data)) { continue }
+            $isAdmx = $true
             $xml = New-Object -TypeName System.Xml.XmlDocument
             $xml.LoadXml($data)
             [pscustomobject]@{ Document = $xml; Origin = 'Registry' }
         }
         catch {
-            Write-LogEntry -Message "Ingested ADMX: a value under AdmxInstalled could not be read ($($_.Exception.GetType().Name)); it is skipped." -Level WARN
+            Write-LogEntry -Message "Ingested ADMX: a value under AdmxInstalled could not be read ($(Get-ReadFailureReason -ErrorRecord $_)); it is skipped." -Level WARN
+            if ($isAdmx) { [pscustomobject]@{ Document = $null; Origin = 'Registry' } }
         }
     }
 }
@@ -1124,17 +1168,19 @@ function Import-AdmxDefinition {
     if (-not [IO.Directory]::Exists($Directory)) { throw "there is no ADMX folder at $Directory" }
 
     $index = [pscustomobject]@{
-        Directory    = $Directory
-        Files        = @{}
-        Failed       = @{}
-        ByFile       = @{}
-        Ingested     = @{}
-        IngestedName = @{}
-        ByValue      = @{}
-        ByListKey    = @{}
-        ByKey        = @{}
-        WithoutAdml  = 0
-        IngestedFrom = @{ File = 0; Registry = 0 }
+        Directory          = $Directory
+        Files              = @{}
+        Failed             = @{}
+        ByFile             = @{}
+        Ingested           = @{}
+        IngestedName       = @{}
+        ByValue            = @{}
+        ByListKey          = @{}
+        ByKey              = @{}
+        WithoutAdml        = 0
+        IngestedFrom       = @{ File = 0; Registry = 0 }
+        # Copies that looked like ADMX but could not be read; each one is in the log.
+        IngestedUnreadable = 0
     }
     $all = [System.Collections.Generic.List[object]]::new()
 
@@ -1177,6 +1223,10 @@ function Import-AdmxDefinition {
     $documents = [System.Collections.Generic.List[object]]::new()
     $categories = @{}
     foreach ($copy in $ingested) {
+        if ($null -eq $copy.Document) {
+            $index.IngestedUnreadable++
+            continue
+        }
         try {
             $label = 'ingested ADMX'
             $target = $copy.Document.SelectSingleNode("/*[local-name()='policyDefinitions']/*[local-name()='policyNamespaces']/*[local-name()='target']")
@@ -1185,6 +1235,7 @@ function Import-AdmxDefinition {
         }
         catch {
             Write-LogEntry -Message "Ingested ADMX: a document could not be read: $($_.Exception.Message)" -Level WARN
+            $index.IngestedUnreadable++
             continue
         }
         $index.IngestedFrom[$copy.Origin]++
@@ -2653,7 +2704,7 @@ try {
             $ingestedDirectories = @([IO.Directory]::GetDirectories((Join-Path -Path $env:ProgramData -ChildPath 'Microsoft'), 'PolicyManager*'))
         }
         catch {
-            Write-LogEntry -Message "Ingested ADMX: %ProgramData%\Microsoft could not be listed ($($_.Exception.GetType().Name)); only the registry is searched." -Level WARN
+            Write-LogEntry -Message "Ingested ADMX: %ProgramData%\Microsoft could not be listed ($(Get-ReadFailureReason -ErrorRecord $_)); only the registry is searched." -Level WARN
         }
         $admxIndex = Import-AdmxDefinition -Directory $PolicyDefinitionsDirectory -IngestedDirectory $ingestedDirectories -Root $machine -Language $languages
         if ($admxIndex.Failed.Count -gt 0) {
@@ -2661,9 +2712,9 @@ try {
             Write-Warning ('{0} ADMX file(s) in {1} could not be read, so the settings they define are compared as without ADMX definitions: {2}' -f
                 $failures.Count, $PolicyDefinitionsDirectory, ($failures -join '; '))
         }
-        Write-LogEntry -Message ('ADMX definitions read in {0:N1} s: {1} files, {2} not readable, {3} without ADML; ingested documents: {4} from files, {5} from the registry.' -f
+        Write-LogEntry -Message ('ADMX definitions read in {0:N1} s: {1} files, {2} not readable, {3} without ADML; ingested documents: {4} from files, {5} from the registry, {6} not readable.' -f
             $admxTimer.Elapsed.TotalSeconds, $admxIndex.Files.Count, $admxIndex.Failed.Count, $admxIndex.WithoutAdml,
-            $admxIndex.IngestedFrom['File'], $admxIndex.IngestedFrom['Registry'])
+            $admxIndex.IngestedFrom['File'], $admxIndex.IngestedFrom['Registry'], $admxIndex.IngestedUnreadable)
     }
     catch {
         $admxIndex = $null
