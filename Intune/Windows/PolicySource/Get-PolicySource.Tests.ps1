@@ -903,8 +903,56 @@ Describe 'Get-PolicySource' -Skip:([Environment]::OSVersion.Platform -ne 'Win32N
 
             $index.IngestedFrom['File'] | Should -Be 1
             $index.IngestedFrom['Registry'] | Should -Be 1
+            $index.IngestedUnreadable | Should -Be 0
             $index.Ingested['vendorapp~vendorsync|syncnow'].Label | Should -Be 'ingested vendorapp: SyncNow'
             $index.Ingested['othertool|remote'].Key | Should -Be 'SOFTWARE\Policies\Other\Tool'
+        }
+
+        It 'reads an ingested copy kept as UTF-16 under a declaration that says utf-8, with or without a BOM' {
+            # The shape found on an enrolled device: the declaration runs straight into the root
+            # element, and XmlDocument.Load, following the declaration, stops at the zero byte
+            # after the next '<'.
+            $folder = Join-Path -Path $TestDrive -ChildPath ('Wide' + [guid]::NewGuid().ToString('n'))
+            $null = New-Item -Path $folder -ItemType Directory -Force
+            $text = $script:IngestedInRegistry.Replace("?>`r`n", '?>')
+            $withoutBom = Join-Path -Path $folder -ChildPath ([guid]::NewGuid().ToString('n'))
+            [IO.File]::WriteAllBytes($withoutBom, [Text.Encoding]::Unicode.GetBytes($text))
+            [IO.File]::WriteAllText((Join-Path -Path $folder -ChildPath ([guid]::NewGuid().ToString('n'))), $text, [Text.Encoding]::Unicode)
+            { (New-Object -TypeName System.Xml.XmlDocument).Load($withoutBom) } | Should -Throw '*hexadecimal value 0x00. Line 1, position 40*'
+
+            $index = Import-AdmxDefinition -Directory $script:AdmxDirectory -IngestedDirectory @($folder)
+
+            $index.IngestedFrom['File'] | Should -Be 2
+            $index.IngestedUnreadable | Should -Be 0
+            $index.Ingested['othertool|remote'].Key | Should -Be 'SOFTWARE\Policies\Other\Tool'
+        }
+
+        It 'counts an ingested copy it cannot read, and logs why without naming the file' {
+            $folder = Join-Path -Path $TestDrive -ChildPath ('Unreadable' + [guid]::NewGuid().ToString('n'))
+            $null = New-Item -Path $folder -ItemType Directory -Force
+            $name = [guid]::NewGuid().ToString('n')
+            [IO.File]::WriteAllText((Join-Path -Path $folder -ChildPath $name), '<policyDefinitions><policies><policy name="Cut"', (New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false))
+            $script:Logged = [System.Collections.Generic.List[string]]::new()
+            Mock Write-LogEntry { $script:Logged.Add($Message) }
+
+            $index = Import-AdmxDefinition -Directory $script:AdmxDirectory -IngestedDirectory @($folder)
+
+            $index.IngestedFrom['File'] | Should -Be 0
+            $index.IngestedUnreadable | Should -Be 1
+            $warning = @($script:Logged | Where-Object { $_ -like 'Ingested ADMX: a file under*' })
+            $warning.Count | Should -Be 1
+            $warning[0] | Should -BeLike '*(XmlException 0x80131940: *Line 1, position *); it is skipped.'
+            $warning[0] | Should -Not -BeLike "*$name*"
+        }
+
+        It 'gives a read failure as the innermost type and HRESULT, with the message only for an XML error' {
+            $missing = Join-Path -Path $TestDrive -ChildPath ('Missing' + [guid]::NewGuid().ToString('n'))
+            $fileError = try { [IO.File]::OpenRead($missing) } catch { $_ }
+            $xmlError = try { (New-Object -TypeName System.Xml.XmlDocument).LoadXml('<a') } catch { $_ }
+
+            $fileError.Exception | Should -BeOfType ([System.Management.Automation.MethodInvocationException])
+            Get-ReadFailureReason -ErrorRecord $fileError | Should -Be 'FileNotFoundException 0x80070002'
+            Get-ReadFailureReason -ErrorRecord $xmlError | Should -BeLike 'XmlException 0x80131940: *Line 1, position *'
         }
 
         It 'stops with a reason when there is no ADMX folder' {
