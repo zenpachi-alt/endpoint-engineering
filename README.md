@@ -165,7 +165,9 @@ step, so a test that fails only in CI fails locally too.
 Every tool CI installs is pinned, so a result changes only with a commit.
 PSScriptAnalyzer, Pester and `Microsoft.Graph.Authentication` are held to exact
 versions in `$PinnedModule` in the check script; raise one there after running
-the checks locally against the new release. Actions are pinned by commit, with
+the checks locally against the new release. A runner's image carries its own
+copy of `Microsoft.Graph.Authentication`, which moves ahead of the pin; the
+tests are given the pinned one all the same. Actions are pinned by commit, with
 the release in a comment, and [`.github/dependabot.yml`](.github/dependabot.yml)
 proposes updates to them monthly as pull requests that CI checks first.
 
