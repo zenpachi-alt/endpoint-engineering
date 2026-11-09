@@ -19,11 +19,16 @@ concurrency:
 # each runs even after an earlier one fails, so one run shows every failure.
 # Actions are pinned by commit, with the release in a comment; Dependabot
 # proposes updates to them.
+#
+# Each job has a time limit several times its usual run, about two minutes on
+# Linux and seven on Windows. Many tests start a process and wait for it, and
+# one that never returned would otherwise hold a runner for GitHub's six hours.
 
 jobs:
   linux:
     name: Checks under PowerShell 7 on Linux
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       # Two commits deep, so the Version check has HEAD^1 to compare with: in a
       # pull request, the tip of the branch it merges into; on main, the commit
@@ -66,6 +71,7 @@ jobs:
   windows:
     name: Checks on Windows, under Windows PowerShell 5.1 and PowerShell 7
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
