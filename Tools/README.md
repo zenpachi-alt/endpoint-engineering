@@ -63,11 +63,17 @@ shells start every CI step with it. A test that only passed under a gentler
 preference would pass locally and fail in CI.
 
 The module versions live in `$PinnedModule`. Each check imports exactly that
-version and stops with the install command when it is missing. `-Strict`, which
-CI passes, also fails the run when the Graph helper tests would load a
-`Microsoft.Graph.Authentication` other than the pinned one: they import the
-highest version installed, so a newer copy would silently replace the pin.
-Locally that is a warning.
+version and stops with the install command when it is missing.
+
+The Graph helper tests load `Microsoft.Graph.Authentication` themselves, at
+2.0.0 or later, so they would take whichever copy PowerShell finds first. On a
+hosted runner that is the copy its image carries, which moves ahead of the pin
+with no commit here. Under PowerShell 7, when another copy would be found
+before the pinned one, the Pester check copies the pinned one to a folder of
+its own, puts that folder first on the module path for the length of the run,
+and says so. `-Strict`, which CI passes, fails the run when the pinned version
+is not installed at all; locally that is a warning. Under Windows PowerShell
+the tests that need the real SDK are skipped, and no pin is kept.
 
 ## The Version check
 

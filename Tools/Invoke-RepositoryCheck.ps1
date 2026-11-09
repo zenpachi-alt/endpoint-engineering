@@ -49,6 +49,15 @@
     check imports exactly the pinned version. A missing one stops the check
     with the command that installs it; -InstallModule installs it instead.
 
+    The Graph helper tests, and the processes they start, load
+    Microsoft.Graph.Authentication themselves, at 2.0.0 or later, and would
+    take whichever copy PowerShell finds first: on a hosted runner, the one
+    its image carries, which changes with no commit here. Under PowerShell 7,
+    when another copy would be found before the pinned one, the Pester check
+    copies the pinned one to a folder of its own in the temporary folder, puts
+    that folder first on the module path for the length of the run, and says
+    so.
+
     Unlike the other scripts in this repository, this one does not run on its
     own outside a clone: it exists to run the repository's own files, the
     scanner and the tests.
@@ -71,10 +80,10 @@
     PowerShell 7 keep separate modules, so locally it is needed once in each.
 
 .PARAMETER Strict
-    Fail, rather than warn, when the Graph helper tests would run against a
-    Microsoft.Graph.Authentication other than the pinned version, or without
-    one. Those tests import the highest version installed, so a newer copy
-    would silently replace the pin. CI runs with it.
+    Fail, rather than warn, when the pinned Microsoft.Graph.Authentication is
+    not installed, so that the Graph helper tests would run against another
+    version or without one. Another version installed beside the pinned one
+    is no failure: the tests are given the pinned one. CI runs with it.
 
 .PARAMETER PesterOutput
     How much Pester prints: None, Normal (failures and totals) or Detailed
@@ -104,8 +113,8 @@
 
 .NOTES
     Author        : Tomasz Pietryka
-    Version       : 1.1.0
-    Last updated  : 2026-11-04
+    Version       : 1.2.0
+    Last updated  : 2026-11-09
 
     PowerShell    : 5.1 or later. CI runs Parse and Pester under Windows
                     PowerShell 5.1, and every check under PowerShell 7.
@@ -180,6 +189,9 @@ $Results = [System.Collections.Generic.List[object]]::new()
 # sees them used: it does not follow a parameter into the functions that read it.
 $Options = @{ InstallModule = [bool]$InstallModule; Strict = [bool]$Strict; PesterOutput = $PesterOutput; Base = $Base }
 
+# What a check leaves for another function to take back.
+$State = @{ PinnedModuleFolder = $null }
+
 function Add-CheckResult {
     [CmdletBinding()]
     param (
@@ -243,31 +255,69 @@ function Import-PinnedModule {
     Import-Module -Name $Name -RequiredVersion $version -ErrorAction Stop
 }
 
-function Confirm-GraphModulePin {
-    # The Graph helper tests import the highest Microsoft.Graph.Authentication installed,
-    # whatever this script pins, so the pin is only kept by checking what that would be.
+function Use-PinnedGraphModule {
+    # Gives the Graph helper tests the pinned Microsoft.Graph.Authentication, whatever else is
+    # installed. They, and the processes they start, ask for 2.0.0 or later, and PowerShell
+    # answers from the first folder on the module path that has one. A hosted runner's image
+    # carries its own copy, which moves ahead of the pin with no commit here. So when another
+    # copy would be found first, the pinned one is copied to a folder of its own and that
+    # folder is put first on the path. Restore-ModulePath takes both back.
     [CmdletBinding()]
     param ()
 
     $name = 'Microsoft.Graph.Authentication'
     $pin = $PinnedModule[$name]
-    if ($Options.InstallModule -and -not (Get-Module -ListAvailable -Name $name | Where-Object { $_.Version -eq $pin })) {
+    $pinned = Get-Module -ListAvailable -Name $name | Where-Object { $_.Version -eq $pin } | Select-Object -First 1
+    if ($null -eq $pinned -and $Options.InstallModule) {
         Install-PinnedModule -Name $name
+        $pinned = Get-Module -ListAvailable -Name $name | Where-Object { $_.Version -eq $pin } | Select-Object -First 1
     }
-    $highest = Get-Module -ListAvailable -Name $name | Sort-Object -Property Version -Descending | Select-Object -First 1
+    # Listed in the order of the module path: the first is the one a test would load.
+    $first = Get-Module -ListAvailable -Name $name | Select-Object -First 1
 
-    $problem = $null
-    if ($null -eq $highest) {
-        $problem = 'is not installed, so the Graph helper tests skip their real-SDK part'
-    }
-    elseif ($highest.Version -ne $pin) {
-        $problem = 'would be {0} in the tests, not the pinned {1}. Raise the pin, or remove the newer copy' -f
-        $highest.Version, $pin
-    }
-    if ($null -ne $problem) {
-        $message = '{0} {1}.' -f $name, $problem
+    if ($null -eq $pinned) {
+        $problem = if ($null -eq $first) { 'is not installed, so the Graph helper tests skip their real-SDK part' }
+        else { 'is installed as {0}, not the pinned {1}, so the Graph helper tests would run against {0}' -f $first.Version, $pin }
+        $message = ('{0} {1}. Run this script with -InstallModule, or: Install-Module -Name {0} ' +
+            '-RequiredVersion {2} -Scope CurrentUser') -f $name, $problem, $pin
         if ($Options.Strict) { throw $message }
         Write-Warning $message
+        return
+    }
+    if ($first.Version -eq $pin) { return }
+
+    $folder = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('EndpointEngineering.PinnedModule.{0}' -f [guid]::NewGuid().ToString('n'))
+    $target = Join-Path -Path $folder -ChildPath (Join-Path -Path $name -ChildPath $pin.ToString())
+    $State.PinnedModuleFolder = $folder
+    $null = New-Item -ItemType Directory -Path (Split-Path -Path $target -Parent) -Force -ErrorAction Stop
+    Copy-Item -LiteralPath $pinned.ModuleBase -Destination $target -Recurse -ErrorAction Stop
+    $env:PSModulePath = $folder, $env:PSModulePath -join [System.IO.Path]::PathSeparator
+
+    $loaded = Get-Module -ListAvailable -Name $name | Select-Object -First 1
+    if ($null -eq $loaded -or $loaded.Version -ne $pin) {
+        throw ('{0} {1} was put first on the module path, in ''{2}'', and PowerShell still finds {3} first.' -f
+            $name, $pin, $folder, $(if ($null -eq $loaded) { 'none' } else { $loaded.Version }))
+    }
+    Write-Output ('{0} {1} would be found before the pinned {2}. The tests get a copy of the pinned one, put first on the module path.' -f
+        $name, $first.Version, $pin)
+}
+
+function Restore-ModulePath {
+    # Takes back what Use-PinnedGraphModule did: the module path, which outlives this script in
+    # the session that ran it, and the folder. A test that loaded the module in this process
+    # keeps its files open on Windows; the folder is then left in the temporary folder.
+    [CmdletBinding()]
+    param ([Parameter(Mandatory)] [AllowEmptyString()] [string]$ModulePath)
+
+    $env:PSModulePath = $ModulePath
+    $folder = $State.PinnedModuleFolder
+    $State.PinnedModuleFolder = $null
+    if (-not $folder -or -not (Test-Path -LiteralPath $folder)) { return }
+    try {
+        Remove-Item -LiteralPath $folder -Recurse -Force -ErrorAction Stop
+    }
+    catch {
+        Write-Warning ('The copy of the pinned module in ''{0}'' could not be removed: {1}' -f $folder, $_.Exception.Message)
     }
 }
 
@@ -521,21 +571,30 @@ function Invoke-PesterCheck {
         }
     }
     else {
-        Confirm-GraphModulePin
         $tests = @($Path)
     }
 
-    $configuration = New-PesterConfiguration
-    $configuration.Run.Path = [string[]]$tests
-    $configuration.Run.PassThru = $true
-    $configuration.Output.Verbosity = $Options.PesterOutput
-    # The tests inherit the caller's preference and strict mode. They get CI's preference,
-    # and none of this script's strictness, which they were not written for.
-    $run = & {
-        Set-StrictMode -Off
-        $ErrorActionPreference = 'Stop'
-        Invoke-Pester -Configuration $configuration
-    } | Select-Object -Last 1
+    $modulePath = $env:PSModulePath
+    try {
+        # Under Windows PowerShell the tests that need the real SDK are skipped, so there is
+        # no pin to keep.
+        if (-not $IsDesktop) { Use-PinnedGraphModule }
+
+        $configuration = New-PesterConfiguration
+        $configuration.Run.Path = [string[]]$tests
+        $configuration.Run.PassThru = $true
+        $configuration.Output.Verbosity = $Options.PesterOutput
+        # The tests inherit the caller's preference and strict mode. They get CI's preference,
+        # and none of this script's strictness, which they were not written for.
+        $run = & {
+            Set-StrictMode -Off
+            $ErrorActionPreference = 'Stop'
+            Invoke-Pester -Configuration $configuration
+        } | Select-Object -Last 1
+    }
+    finally {
+        Restore-ModulePath -ModulePath $modulePath
+    }
 
     $detail = '{0} passed, {1} failed, {2} skipped under {3}' -f $run.PassedCount, $run.FailedCount, $run.SkippedCount, $Edition
     if ($run.Result -ne 'Passed') {

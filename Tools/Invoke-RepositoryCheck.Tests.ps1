@@ -19,6 +19,14 @@
     only hand the repository to PSScriptAnalyzer and Pester; CI runs them on
     every push, and a mistake in them shows there at once.
 
+    One part of the Pester check is tested here all the same: which copy of
+    Microsoft.Graph.Authentication the tests are given. Those tests start the
+    script in a process of its own, because Pester cannot run inside the run
+    that is testing it, with made-up copies of the module, a manifest and
+    nothing else, first on its module path. They run under PowerShell 7, where
+    the check keeps that pin, and where Pester is installed at its pinned
+    version.
+
 .EXAMPLE
     Invoke-Pester -Path .\Tools\Invoke-RepositoryCheck.Tests.ps1 -Output Detailed
 
@@ -29,8 +37,16 @@
     Graph scopes  : None.
     Admin consent : Not applicable.
     Licensing     : None.
-    Modules       : Pester 5.5.0 or later. git, for the Version tests.
+    Modules       : Pester 5.5.0 or later. git, for the Version tests. Pester
+                    at the pinned version for the tests of the Pester check.
 #>
+
+BeforeDiscovery {
+    $scriptText = Get-Content -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath 'Invoke-RepositoryCheck.ps1') -Raw
+    $pesterPin = [version][regex]::Match($scriptText, '\x27Pester\x27\s+= \[version\]\x27([^\x27]+)\x27').Groups[1].Value
+    $script:SkipPesterCheck = $PSVersionTable.PSEdition -eq 'Desktop' -or
+        -not (Get-Module -ListAvailable -Name Pester | Where-Object { $_.Version -eq $pesterPin })
+}
 
 BeforeAll {
     $script:ScriptPath = Join-Path -Path $PSScriptRoot -ChildPath 'Invoke-RepositoryCheck.ps1'
@@ -296,6 +312,126 @@ Describe 'Invoke-RepositoryCheck' {
             $leak.Text | Should -Match 'leak\.txt'
             $leak.Text | Should -Match 'values masked'
             $leak.Warnings | Should -Match '1 finding'
+        }
+    }
+
+    Context 'Pester, and which Microsoft.Graph.Authentication the tests are given' -Skip:$script:SkipPesterCheck {
+
+        BeforeAll {
+            $script:GraphName = 'Microsoft.Graph.Authentication'
+            $script:ScriptText = Get-Content -LiteralPath $script:ScriptPath -Raw
+            $script:GraphPin = [regex]::Match($script:ScriptText, '\x27Microsoft\.Graph\.Authentication\x27\s+= \[version\]\x27([^\x27]+)\x27').Groups[1].Value
+            $script:PowerShellPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+
+            # Tests for the repository under test: they pass only where the pinned copy is the one
+            # PowerShell finds, here and in a process started from here.
+            $script:ProbeTest = @(
+                "Describe 'The module path the tests are given' {"
+                "    It 'has the pinned copy first' {"
+                "        @(Get-Module -ListAvailable -Name $script:GraphName)[0].Version | Should -Be ([version]'$script:GraphPin')"
+                '    }'
+                "    It 'gives the pinned copy to a process started from here' {"
+                "        `$command = 'Import-Module -Name $script:GraphName -MinimumVersion 2.0.0; (Get-Module -Name $script:GraphName).Version.ToString()'"
+                '        $loaded = & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -Command $command'
+                "        `$loaded | Should -Be '$script:GraphPin'"
+                '    }'
+                '}'
+            ) -join "`n"
+            $script:PassingTest = "Describe 'Anything' { It 'passes' { `$true | Should -BeTrue } }"
+
+            function Write-TestModuleFolder {
+                # A folder for the module path, holding the module at one version: a manifest and nothing else.
+                param ([string]$Version)
+                $root = Join-Path -Path $TestDrive -ChildPath ([guid]::NewGuid().ToString('n'))
+                $folder = Join-Path -Path $root -ChildPath (Join-Path -Path $script:GraphName -ChildPath $Version)
+                $null = New-Item -ItemType Directory -Path $folder
+                Set-Content -LiteralPath (Join-Path -Path $folder -ChildPath "$script:GraphName.psd1") -Value "@{ ModuleVersion = '$Version' }"
+                $root
+            }
+
+            function Invoke-UnderTestAsProcess {
+                # The script in a process of its own, with the given folders first on its module path
+                # and a temporary folder of its own, so that what it leaves there is its doing alone.
+                # The text comes back without white space, because the host wraps what it writes.
+                param ([string]$ScriptPath = $script:ScriptPath, [string[]]$ModuleFolder, [string[]]$Argument)
+                $temporary = Join-Path -Path $TestDrive -ChildPath ([guid]::NewGuid().ToString('n'))
+                $null = New-Item -ItemType Directory -Path $temporary
+                # TMP and TEMP on Windows, TMPDIR elsewhere.
+                $saved = @{ PSModulePath = $env:PSModulePath; TMP = $env:TMP; TEMP = $env:TEMP; TMPDIR = $env:TMPDIR }
+                $ErrorActionPreference = 'Continue'
+                try {
+                    $env:PSModulePath = (@($ModuleFolder) + $saved.PSModulePath) -join [System.IO.Path]::PathSeparator
+                    $env:TMP = $env:TEMP = $env:TMPDIR = $temporary
+                    $output = @(& $script:PowerShellPath -NoProfile -NonInteractive -File $ScriptPath @Argument 2>&1)
+                    $exitCode = $LASTEXITCODE
+                }
+                finally {
+                    # Assigning $null takes away a variable that was not set before.
+                    $env:PSModulePath = $saved.PSModulePath
+                    $env:TMP = $saved.TMP
+                    $env:TEMP = $saved.TEMP
+                    $env:TMPDIR = $saved.TMPDIR
+                }
+                [pscustomobject]@{
+                    Text         = (@($output | ForEach-Object { [string]$_ }) -join '') -replace '\s', ''
+                    ExitCode     = $exitCode
+                    # The folders the check made for the pinned copy and did not remove.
+                    PinnedCopies = @(Get-ChildItem -LiteralPath $temporary -Directory -Filter 'EndpointEngineering.PinnedModule.*')
+                }
+            }
+        }
+
+        It 'gives the tests the pinned copy when a newer one comes first on the module path, says so, and removes its copy' {
+            $repository = Write-TestRepository -File @{ 'Probe.Tests.ps1' = $script:ProbeTest }
+            $folders = (Write-TestModuleFolder -Version '99.0.0'), (Write-TestModuleFolder -Version $script:GraphPin)
+
+            $result = Invoke-UnderTestAsProcess -ModuleFolder $folders -Argument '-Path', $repository, '-Check', 'Pester', '-Strict', '-PesterOutput', 'None'
+
+            $result.Text | Should -Match 'PesterPassed2passed,0failed'
+            $result.ExitCode | Should -Be 0
+            $result.Text | Should -Match ('{0}99\.0\.0wouldbefoundbeforethepinned{1}' -f [regex]::Escape($script:GraphName), [regex]::Escape($script:GraphPin))
+            $result.PinnedCopies | Should -BeNullOrEmpty
+        }
+
+        It 'leaves the module path alone when the pinned copy comes first' {
+            $repository = Write-TestRepository -File @{ 'Probe.Tests.ps1' = $script:ProbeTest }
+            $folders = (Write-TestModuleFolder -Version $script:GraphPin), (Write-TestModuleFolder -Version '99.0.0')
+
+            $result = Invoke-UnderTestAsProcess -ModuleFolder $folders -Argument '-Path', $repository, '-Check', 'Pester', '-Strict', '-PesterOutput', 'None'
+
+            $result.Text | Should -Match 'PesterPassed2passed,0failed'
+            $result.ExitCode | Should -Be 0
+            $result.Text | Should -Not -Match 'wouldbefoundbeforethepinned'
+        }
+
+        Context 'where the pinned version is not installed' {
+
+            BeforeAll {
+                # A copy of the script that pins a version no machine has.
+                $script:Repository = Write-TestRepository -Folder 'Tools' -File @{ 'Any.Tests.ps1' = $script:PassingTest }
+                $script:Unpinned = Join-Path -Path $script:Repository -ChildPath 'Tools/Invoke-RepositoryCheck.ps1'
+                $pattern = '(\x27Microsoft\.Graph\.Authentication\x27\s+= \[version\])\x27[^\x27]+\x27'
+                [IO.File]::WriteAllText($script:Unpinned, ($script:ScriptText -replace $pattern, '$1''0.0.1'''))
+                $script:Newer = Write-TestModuleFolder -Version '99.0.0'
+            }
+
+            It 'fails with -Strict, naming the version the tests would run against and how to install the pinned one' {
+                $result = Invoke-UnderTestAsProcess -ScriptPath $script:Unpinned -ModuleFolder $script:Newer `
+                    -Argument '-Path', $script:Repository, '-Check', 'Pester', '-Strict', '-PesterOutput', 'None'
+
+                $result.ExitCode | Should -Be 1
+                $result.Text | Should -Match 'Pestercouldnotrun:Microsoft\.Graph\.Authenticationisinstalledas99\.0\.0,notthepinned0\.0\.1'
+                $result.Text | Should -Match 'Runthisscriptwith-InstallModule'
+            }
+
+            It 'warns without -Strict, and runs the tests' {
+                $result = Invoke-UnderTestAsProcess -ScriptPath $script:Unpinned -ModuleFolder $script:Newer `
+                    -Argument '-Path', $script:Repository, '-Check', 'Pester', '-PesterOutput', 'None'
+
+                $result.ExitCode | Should -Be 0
+                $result.Text | Should -Match 'WARNING:Microsoft\.Graph\.Authenticationisinstalledas99\.0\.0,notthepinned0\.0\.1'
+                $result.Text | Should -Match 'PesterPassed1passed,0failed'
+            }
         }
     }
 
