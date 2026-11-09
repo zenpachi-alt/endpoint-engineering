@@ -27,7 +27,10 @@
     that go together, so that a catch block reports the failure and not an
     error of its own. Where Microsoft.Graph.Authentication is not installed,
     the template is also started as a file, and must exit 1 and say what to
-    install. The scripts' own tests start them as files where it is installed.
+    install. No machine CI runs on is without the module, so the template is
+    started once more with a copy that cannot load put first on the module
+    path: the same failure, on every machine. The scripts' own tests start
+    them as files where it is installed.
 
     Module load: where Microsoft.Graph.Authentication is installed, the
     template's Graph module region is run as a file with -WhatIf and with
@@ -207,6 +210,42 @@ Describe 'The template, run as a file where the module is not installed' -Skip:$
 
         $exitCode | Should -Be 1
         $text | Should -BeLike '*Microsoft.Graph.Authentication2.0.0orlatercouldnotbeloaded*Install-Module-NameMicrosoft.Graph.Authentication*'
+    }
+}
+
+Describe 'The template, run as a file where the module cannot be loaded' {
+
+    It 'exits 1, gives the reason and says what to install' {
+        # The test above runs only where the module is missing, which is no
+        # machine CI runs on. This one runs everywhere. A copy that throws as
+        # it loads, at a version no release has, is put first on the module
+        # path, where PowerShell finds it before a real one. For the script
+        # the failure is the same: the import throws before anything else
+        # has run.
+        $name = 'Microsoft.Graph.Authentication'
+        $folder = Join-Path -Path $TestDrive -ChildPath ([guid]::NewGuid().ToString('n'))
+        $module = Join-Path -Path $folder -ChildPath (Join-Path -Path $name -ChildPath '99.0.0')
+        $null = New-Item -ItemType Directory -Path $module
+        Set-Content -LiteralPath (Join-Path -Path $module -ChildPath "$name.psd1") -Value "@{ ModuleVersion = '99.0.0'; RootModule = '$name.psm1' }"
+        Set-Content -LiteralPath (Join-Path -Path $module -ChildPath "$name.psm1") -Value "throw 'This copy cannot be loaded.'"
+
+        # Continue, not the caller's Stop, for the reason in the test above.
+        # The child process inherits the module path, which is put back after.
+        $modulePath = $env:PSModulePath
+        $ErrorActionPreference = 'Continue'
+        try {
+            $env:PSModulePath = $folder, $modulePath -join [System.IO.Path]::PathSeparator
+            $output = @(& (Get-Process -Id $PID).Path -NoProfile -NonInteractive -File $script:TemplatePath `
+                    -TenantId 'contoso.onmicrosoft.com' -GroupId ([guid]::Empty.ToString()) 2>&1)
+            $exitCode = $LASTEXITCODE
+        }
+        finally {
+            $env:PSModulePath = $modulePath
+        }
+        $text = (@($output | ForEach-Object { [string]$_ }) -join '') -replace '\s', ''
+
+        $exitCode | Should -Be 1
+        $text | Should -BeLike '*Microsoft.Graph.Authentication2.0.0orlatercouldnotbeloaded*Thiscopycannotbeloaded.*Install-Module-NameMicrosoft.Graph.Authentication*'
     }
 }
 
