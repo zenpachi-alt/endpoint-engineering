@@ -38,6 +38,7 @@
 
 BeforeDiscovery {
     $guid = [guid]::NewGuid().ToString()
+    $otherGuid = [guid]::NewGuid().ToString()
     $secret = 'Qw7rT9zL' + 'p2Xc5Vb8'
     $address = '10', '20', '30', '40' -join '.'
     $tenant = 'litware' + '.onmicrosoft.com'
@@ -55,9 +56,14 @@ BeforeDiscovery {
         @{ Name = 'a client secret assigned in double quotes'; Rule = 'HardCodedSecret'; Severity = 'Error'; Line = 'client_secret = "{0}"' -f $secret }
         @{ Name = 'an API key after a colon'; Rule = 'HardCodedSecret'; Severity = 'Error'; Line = 'apiKey: "{0}"' -f $secret }
         @{ Name = 'a connection string'; Rule = 'HardCodedSecret'; Severity = 'Error'; Line = 'ConnectionString = "{0}"' -f $secret }
+        @{ Name = 'a client secret under a quoted JSON key'; Rule = 'HardCodedSecret'; Severity = 'Error'; Line = '"clientSecret": "{0}"' -f $secret }
+        @{ Name = 'a password under a key in single quotes'; Rule = 'HardCodedSecret'; Severity = 'Error'; Line = "'password' = '{0}'" -f $secret }
         @{ Name = 'a GUID'; Rule = 'Guid'; Severity = 'Warning'; Line = "TenantId $guid" }
         @{ Name = 'a GUID in capitals'; Rule = 'Guid'; Severity = 'Warning'; Line = $guid.ToUpperInvariant() }
         @{ Name = 'a GUID in braces'; Rule = 'Guid'; Severity = 'Warning'; Line = "{$guid}" }
+        @{ Name = 'a GUID between underscores'; Rule = 'Guid'; Severity = 'Warning'; Line = "policy_${guid}_assignment" }
+        @{ Name = 'a GUID that follows a letter'; Rule = 'Guid'; Severity = 'Warning'; Line = "id$guid" }
+        @{ Name = 'two GUIDs written back to back'; Rule = 'Guid', 'Guid'; Severity = 'Warning'; Line = "$guid$otherGuid" }
         @{ Name = 'an email address'; Rule = 'EmailOrUpn'; Severity = 'Warning'; Line = 'megan', 'litwareinc.com' -join '@' }
         @{ Name = 'an address in a domain that only ends like an allowed one'; Rule = 'EmailOrUpn'; Severity = 'Warning'
             Line = 'megan', 'notcontoso.com' -join '@'
@@ -78,6 +84,7 @@ BeforeDiscovery {
     # One line each, which no rule may report.
     $script:Allowed = @(
         @{ Name = 'a secret placeholder in angle brackets'; Line = 'password = "<YourPassword>"' }
+        @{ Name = 'a secret placeholder under a quoted JSON key'; Line = '"clientSecret": "<ClientSecret>"' }
         @{ Name = 'a secret read from the environment'; Line = '$Password = "$env:APP_PASSWORD"' }
         @{ Name = 'a secret read from a subexpression'; Line = 'client_secret = "$($Credential.Secret)"' }
         @{ Name = 'a secret marked as an example'; Line = 'api_key = "example-key-0001"' }
@@ -238,6 +245,18 @@ Describe 'Test-SensitiveContent' {
                 Should -Be ('{0}...{1} (36 chars)' -f $script:Guid.Substring(0, 4), $script:Guid.Substring(34))
         }
 
+        It 'shows them of a value of 24 characters, where they are a quarter of it' {
+            $result = Invoke-LineScan -Line (('m' * 9), 'litwareinc.com' -join '@')
+
+            $result.Findings[0].Match | Should -Be 'mmmm...om (24 chars)'
+        }
+
+        It 'shows asterisks only for a value of 23 characters' {
+            $result = Invoke-LineScan -Line (('m' * 8), 'litwareinc.com' -join '@')
+
+            $result.Findings[0].Match | Should -Be ('*' * 23)
+        }
+
         It 'keeps the value out of everything it writes' {
             $result = Invoke-LineScan -Line "id $script:Guid"
 
@@ -246,10 +265,15 @@ Describe 'Test-SensitiveContent' {
             $result.Warnings | Should -Match 'Values are masked'
         }
 
-        It 'replaces a value of eight characters or fewer with asterisks' {
-            $result = Invoke-LineScan -Line ('10', '1', '2', '3' -join '.')
+        It 'shows asterisks only for an IP address, whatever its length' -ForEach @(
+            @{ Octet = '10', '1', '2', '3' }
+            @{ Octet = '192', '168', '100', '200' }
+        ) {
+            $address = $Octet -join '.'
 
-            $result.Findings[0].Match | Should -Be '********'
+            $result = Invoke-LineScan -Line $address
+
+            $result.Findings[0].Match | Should -Be ('*' * $address.Length)
         }
 
         It 'shows the value with -ShowMatch' {
@@ -377,6 +401,49 @@ Describe 'Test-SensitiveContent' {
 
             $result.ExitCode | Should -Be 0
             $result.Findings | Should -BeNullOrEmpty
+        }
+
+        It 'scans a staged file whose name has a character outside ASCII' {
+            # git writes such a name in quotes, with its bytes escaped, unless asked not to.
+            $name = 'Content/caf{0}.txt' -f [char]0xE9
+            $repository = Write-TestRepository -File @{ $name = "id $script:Guid" }
+            Invoke-TestGit -Repository $repository -Argument 'init', '--quiet'
+            Invoke-TestGit -Repository $repository -Argument 'add', '--', $name
+
+            $result = Invoke-Scanner -Repository $repository -Parameters @{ Staged = $true }
+
+            $result.ExitCode | Should -Be 1
+            @($result.Findings | ForEach-Object File) | Should -Be $name
+        }
+
+        It 'exits 2 and names a staged file it cannot read, rather than passing over it' {
+            $repository = Write-TestRepository
+            Invoke-TestGit -Repository $repository -Argument 'init', '--quiet'
+            # A submodule entry: staged, and with no content of its own to show.
+            Invoke-TestGit -Repository $repository -Argument 'update-index', '--add', '--cacheinfo', ('160000,{0},Vendor/module' -f ('1' * 40))
+
+            $result = Invoke-Scanner -Repository $repository -Parameters @{ Staged = $true }
+            $excluded = Invoke-Scanner -Repository $repository -Parameters @{ Staged = $true; ExcludePath = 'Vendor/*' }
+
+            $result.ExitCode | Should -Be 2
+            $result.Errors | Should -Match "Scan failed: The staged content of 'Vendor/module' could not be read"
+            $excluded.ExitCode | Should -Be 0
+        }
+
+        It 'exits 2 and says why outside a git repository' {
+            $repository = Write-TestRepository
+            # Stops git looking for a repository above TestDrive.
+            $ceiling = $env:GIT_CEILING_DIRECTORIES
+            $env:GIT_CEILING_DIRECTORIES = Split-Path -Path $repository -Parent
+            try {
+                $result = Invoke-Scanner -Repository $repository -Parameters @{ Staged = $true }
+            }
+            finally {
+                $env:GIT_CEILING_DIRECTORIES = $ceiling
+            }
+
+            $result.ExitCode | Should -Be 2
+            $result.Errors | Should -Match 'Scan failed: The staged files could not be listed\. Is this a git repository\?'
         }
     }
 

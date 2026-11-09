@@ -127,7 +127,9 @@ Pester and the 5.1 parser still run before a commit and in CI.
 .\Tools\Test-SensitiveContent.ps1 -ShowMatch
 ```
 
-Exit codes: `0` clean, `1` findings, `2` the scan itself failed.
+Exit codes: `0` clean, `1` findings, `2` the scan itself failed. With `-Staged`,
+a staged file that cannot be read fails the scan rather than being passed over;
+`-ExcludePath` leaves one out, such as a submodule.
 
 ## What it looks for
 
@@ -136,7 +138,7 @@ Exit codes: `0` clean, `1` findings, `2` the scan itself failed.
 | `PrivateKey` | Error | PEM private key blocks. |
 | `BearerToken` | Error | JWTs. |
 | `ProviderToken` | Error | GitHub and Slack style access tokens. |
-| `HardCodedSecret` | Error | `password = "..."`, `client_secret = "..."` and similar literals. |
+| `HardCodedSecret` | Error | `password = "..."`, `"clientSecret": "..."` and similar quoted literals. An unquoted value is not recognised. |
 | `Guid` | Warning | Tenant, object, policy and app IDs. |
 | `EmailOrUpn` | Warning | Addresses and UPNs outside the fictitious domains. |
 | `TenantDomain` | Warning | `*.onmicrosoft.com` other than `contoso`. |
@@ -150,7 +152,9 @@ reserved `.example`, `.invalid` and `.test` TLDs, and dotted quads that are
 really version numbers.
 
 Matched values are masked in output by default, so a finding can be pasted into
-a CI log or an issue without publishing the identifier it reports.
+a CI log or an issue without publishing the identifier it reports. A value of
+24 characters or more shows its first four characters, its last two and its
+length; a shorter one, such as an IP address, shows asterisks only.
 
 ## Handling a false positive
 
