@@ -8,6 +8,7 @@ operate on this repository itself.
 | `Invoke-RepositoryCheck.ps1` | Runs every check CI runs, the way CI runs it, and pins the module versions CI uses. |
 | `Invoke-RepositoryCheck.Tests.ps1` | Pester tests for it, against small repositories built in TestDrive. |
 | `Test-SensitiveContent.ps1` | Scans files or staged content for tenant identifiers and credential material. |
+| `Test-SensitiveContent.Tests.ps1` | Pester tests for it: every rule with values it must report and values it must let through, masking, staged content and exit codes. |
 | `Install-GitHook.ps1` | Points `core.hooksPath` at `Tools/Hooks`, enabling the pre-commit scan in this clone. |
 | `Hooks/pre-commit` | Runs the scan against staged content and blocks the commit on a finding. |
 | `Test-EditedScript.ps1` | Runs PSScriptAnalyzer over one file the way CI does. The Claude Code hook calls it after every edit. |
