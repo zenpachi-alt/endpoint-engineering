@@ -24,8 +24,10 @@
         # sensitive-content:allow
 
     Matched values are masked by default so that findings can be pasted into a
-    build log or an issue without leaking the very thing they flag. Use
-    -ShowMatch locally when you need to see what was found.
+    build log or an issue without leaking the very thing they flag. A value of
+    24 characters or more shows its first four characters, its last two and its
+    length; a shorter one shows asterisks only, because six characters would be
+    most of it. Use -ShowMatch locally when you need to see what was found.
 
     Findings are written to the pipeline as objects. The script exits 1 when
     anything is found, so it can gate a commit or a CI job.
@@ -36,7 +38,9 @@
 .PARAMETER Staged
     Scan the staged content of the current git index instead of the working
     tree. This is what the pre-commit hook uses: it checks what is about to be
-    committed, not what happens to be on disk.
+    committed, not what happens to be on disk. A staged file that cannot be
+    read fails the scan, rather than being passed over and committed unread;
+    -ExcludePath takes one out, such as a submodule.
 
 .PARAMETER AllowPattern
     Additional regular expressions. A match that satisfies any of these is not
@@ -69,8 +73,8 @@
 
 .NOTES
     Author        : Tomasz Pietryka
-    Version       : 1.0.0
-    Last updated  : 2026-09-20
+    Version       : 1.1.0
+    Last updated  : 2026-11-09
 
     PowerShell    : 5.1 or 7. Declared as 5.1 so the pre-commit hook works on a
                     machine without PowerShell 7 installed.
@@ -279,7 +283,8 @@ function Get-ScanRule {
         [pscustomobject]@{
             Name     = 'HardCodedSecret'
             Severity = 'Error'
-            Pattern  = '(?i)\b(?:client_?secret|password|passwd|pwd|api_?key|access_?token|refresh_?token|connection_?string|sas_?token)\b\s*[:=]\s*[''"][^''"]{8,}[''"]'
+            # [''"]? after the name: a JSON key is quoted, as in "clientSecret": "...".
+            Pattern  = '(?i)\b(?:client_?secret|password|passwd|pwd|api_?key|access_?token|refresh_?token|connection_?string|sas_?token)\b[''"]?\s*[:=]\s*[''"][^''"]{8,}[''"]'
             Advice   = 'Secret assigned as a literal. Take it as a parameter or read it at run time.'
             Filter   = {
                 param($m)
@@ -290,7 +295,9 @@ function Get-ScanRule {
         [pscustomobject]@{
             Name     = 'Guid'
             Severity = 'Warning'
-            Pattern  = '\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'
+            # No \b at either end: an underscore, a letter or another GUID beside
+            # it is a word character too, and the GUID would go unreported.
+            Pattern  = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
             Advice   = 'Tenant, object, policy or app ID. Replace with a zeroed placeholder.'
             Filter   = { param($m) Test-AllowedGuid -Guid $m.Value }
         }
@@ -339,6 +346,72 @@ function Get-ScanRule {
     )
 }
 
+function Get-GitOutput {
+    <#
+        .SYNOPSIS
+            Runs git in the repository and returns the lines it writes. Throws,
+            with what git said, when git fails.
+
+        .DESCRIPTION
+            git writes file names and content as UTF-8, and PowerShell reads a
+            native command's output in the console's encoding, which on Windows
+            is a legacy code page: a staged file named with a character outside
+            ASCII would come back as a name git does not know. The console is
+            switched to UTF-8 for the length of the call. Where there is no
+            console to switch, the call goes ahead as it is.
+    #>
+    [CmdletBinding()]
+    [OutputType([string], [object[]])]
+    param (
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$Argument
+    )
+
+    $savedEncoding = $null
+    try {
+        $savedEncoding = [Console]::OutputEncoding
+        [Console]::OutputEncoding = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false
+    }
+    catch {
+        $savedEncoding = $null
+        Write-Verbose "The console encoding could not be set to UTF-8: $($_.Exception.Message)"
+    }
+
+    # Windows PowerShell turns what a native command writes to standard error
+    # into error records, and 'Stop' would throw on the first of them, before
+    # the exit code is read. The call runs under 'Continue' and is judged by
+    # its exit code afterwards.
+    $savedPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $all = @(& git -C $RepositoryRoot @Argument 2>&1)
+        $exitCode = $LASTEXITCODE
+    }
+    catch {
+        # Under 'Continue' a git that cannot be started would otherwise leave
+        # the exit code of whatever ran before it.
+        throw "git could not be started: $($_.Exception.Message)"
+    }
+    finally {
+        $ErrorActionPreference = $savedPreference
+        if ($null -ne $savedEncoding) { [Console]::OutputEncoding = $savedEncoding }
+    }
+
+    if ($exitCode -ne 0) {
+        $said = (@($all | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } |
+                    ForEach-Object { "$_" }) -join ' ').Trim()
+        throw "git $($Argument[0]) failed with exit code ${exitCode}: $said"
+    }
+
+    return @($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } |
+            ForEach-Object { [string]$_ })
+}
+
 function Get-TargetFile {
     <#
         .SYNOPSIS
@@ -360,12 +433,17 @@ function Get-TargetFile {
     )
 
     if ($FromIndex) {
-        $staged = & git -C $RepositoryRoot diff --cached --name-only --diff-filter=ACM
-        if ($LASTEXITCODE -ne 0) {
-            throw "git could not list staged files (exit code $LASTEXITCODE). Is this a git repository?"
+        # -z: each name as it is, ended by a NUL. Without it git writes a name
+        # that has a character outside ASCII in quotes, with its bytes escaped,
+        # and no file is found by that.
+        try {
+            $staged = Get-GitOutput -RepositoryRoot $RepositoryRoot -Argument 'diff', '--cached', '--name-only', '--diff-filter=ACM', '-z'
+        }
+        catch {
+            throw "The staged files could not be listed. Is this a git repository? $($_.Exception.Message)"
         }
 
-        return @($staged | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        return @((@($staged) -join "`n").Split([char]0) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     }
 
     $roots = if ($SearchPath) { $SearchPath } else { @($RepositoryRoot) }
@@ -419,9 +497,14 @@ function Get-FileLine {
     )
 
     if ($FromIndex) {
-        $content = & git -C $RepositoryRoot show ":$RelativePath" 2>$null
-        if ($LASTEXITCODE -ne 0) { return @() }
-        return @($content)
+        # A staged file that cannot be read fails the scan: passed over, it
+        # would be committed unread.
+        try {
+            return @(Get-GitOutput -RepositoryRoot $RepositoryRoot -Argument 'show', ":$RelativePath")
+        }
+        catch {
+            throw "The staged content of '$RelativePath' could not be read, so the scan stopped. Leave the file out with -ExcludePath if it is not text. $($_.Exception.Message)"
+        }
     }
 
     # -Force throughout: on Linux and macOS, PowerShell treats a leading dot as
@@ -453,7 +536,9 @@ function Format-MaskedValue {
         [string]$Value
     )
 
-    if ($Value.Length -le 8) { return ('*' * $Value.Length) }
+    # The six characters shown are a quarter of a value of 24 at most. Of
+    # anything shorter - an IP address, a short name - they would be most.
+    if ($Value.Length -lt 24) { return ('*' * $Value.Length) }
 
     return '{0}...{1} ({2} chars)' -f $Value.Substring(0, 4), $Value.Substring($Value.Length - 2), $Value.Length
 }

@@ -8,6 +8,7 @@ operate on this repository itself.
 | `Invoke-RepositoryCheck.ps1` | Runs every check CI runs, the way CI runs it, and pins the module versions CI uses. |
 | `Invoke-RepositoryCheck.Tests.ps1` | Pester tests for it, against small repositories built in TestDrive. |
 | `Test-SensitiveContent.ps1` | Scans files or staged content for tenant identifiers and credential material. |
+| `Test-SensitiveContent.Tests.ps1` | Pester tests for it: every rule with values it must report and values it must let through, masking, staged content and exit codes. |
 | `Install-GitHook.ps1` | Points `core.hooksPath` at `Tools/Hooks`, enabling the pre-commit scan in this clone. |
 | `Hooks/pre-commit` | Runs the scan against staged content and blocks the commit on a finding. |
 | `Test-EditedScript.ps1` | Runs PSScriptAnalyzer over one file the way CI does. The Claude Code hook calls it after every edit. |
@@ -126,7 +127,9 @@ Pester and the 5.1 parser still run before a commit and in CI.
 .\Tools\Test-SensitiveContent.ps1 -ShowMatch
 ```
 
-Exit codes: `0` clean, `1` findings, `2` the scan itself failed.
+Exit codes: `0` clean, `1` findings, `2` the scan itself failed. With `-Staged`,
+a staged file that cannot be read fails the scan rather than being passed over;
+`-ExcludePath` leaves one out, such as a submodule.
 
 ## What it looks for
 
@@ -135,7 +138,7 @@ Exit codes: `0` clean, `1` findings, `2` the scan itself failed.
 | `PrivateKey` | Error | PEM private key blocks. |
 | `BearerToken` | Error | JWTs. |
 | `ProviderToken` | Error | GitHub and Slack style access tokens. |
-| `HardCodedSecret` | Error | `password = "..."`, `client_secret = "..."` and similar literals. |
+| `HardCodedSecret` | Error | `password = "..."`, `"clientSecret": "..."` and similar quoted literals. An unquoted value is not recognised. |
 | `Guid` | Warning | Tenant, object, policy and app IDs. |
 | `EmailOrUpn` | Warning | Addresses and UPNs outside the fictitious domains. |
 | `TenantDomain` | Warning | `*.onmicrosoft.com` other than `contoso`. |
@@ -149,7 +152,9 @@ reserved `.example`, `.invalid` and `.test` TLDs, and dotted quads that are
 really version numbers.
 
 Matched values are masked in output by default, so a finding can be pasted into
-a CI log or an issue without publishing the identifier it reports.
+a CI log or an issue without publishing the identifier it reports. A value of
+24 characters or more shows its first four characters, its last two and its
+length; a shorter one, such as an IP address, shows asterisks only.
 
 ## Handling a false positive
 
