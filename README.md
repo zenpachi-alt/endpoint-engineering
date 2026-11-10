@@ -184,6 +184,11 @@ pull request. Its hook runs PSScriptAnalyzer over each PowerShell file Claude
 edits, so a finding that would fail CI comes back in the same turn. Personal
 allow rules belong in the git-ignored `.claude/settings.local.json`.
 
+## Reporting a security problem
+
+A flaw that someone could exploit is reported privately, not in a public issue.
+[SECURITY.md](SECURITY.md) says how, what counts, and what to expect.
+
 ## Licence and usage
 
 Released under the MIT License (see [LICENSE.md](LICENSE.md)). You may use,
