@@ -46,6 +46,7 @@ are run by a technician on the device itself.
 | [`Get-PolicySource.ps1`](Intune/Windows/PolicySource/README.md#get-policysourceps1) | For each policy setting on a device: the GPO or MDM setting behind it, conflicts, and GPO settings Intune overrides that RSoP does not show. Offline, read-only. |
 | [`BitLockerKeyEscrow/`](Intune/Windows/Remediations/BitLockerKeyEscrow/) | Remediation package. Finds BitLocker recovery passwords with no evidence of backup to Entra ID, and backs them up, confirmed by Windows' own event. Never reads a password. |
 | [`ComponentRepairSource/`](Intune/Windows/Remediations/ComponentRepairSource/) | Remediation package, detection only. Where DISM would get repair files on each device, listing the devices where it has none. |
+| [`LocalAdministrators/`](Intune/Windows/Remediations/LocalAdministrators/) | Remediation package, detection only. Lists the members of the local Administrators group, and the devices where one is neither built in nor on your allow-list. Removes nobody. |
 | [`SystemFileHealth/`](Intune/Windows/Remediations/SystemFileHealth/) | Remediation package. Finds and repairs corrupt system files: SFC, and DISM only when SFC cannot finish. TimeGuard limits the heavy scans. |
 
 ### Run on their own
