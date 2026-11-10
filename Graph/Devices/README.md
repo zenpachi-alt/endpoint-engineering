@@ -1,11 +1,12 @@
 # Devices
 
-Reporting over Intune managed devices, and cleanup of stale Microsoft Entra
-device objects.
+Reporting over Intune managed devices and Microsoft Entra devices, and cleanup
+of stale Entra device objects.
 
 | Script | Purpose |
 | --- | --- |
 | `Get-BitLockerKeyEscrowReport.ps1` | For every Windows device, whether Entra ID holds its BitLocker recovery key. Never reads a key. |
+| `Get-LapsBackupReport.ps1` | For every joined Windows device, whether Entra ID holds a Windows LAPS backup of its local administrator password, and whether rotation is overdue. Never reads a password. |
 | `Get-ManagedDeviceInventory.ps1` | Every managed device in the tenant, with optional filtering and CSV export. |
 | `Remove-StaleEntraDevice.ps1` | Finds stale Entra device objects, disables them, and deletes them after a grace period: one explicit stage per run, report by default. **Deletion cannot be undone.** |
 
@@ -206,6 +207,123 @@ is a real tenant's answers.
 - [List recoveryKeys](https://learn.microsoft.com/graph/api/bitlocker-list-recoverykeys)
 - [bitlockerRecoveryKey resource type](https://learn.microsoft.com/graph/api/resources/bitlockerrecoverykey)
 - [List managedDevices](https://learn.microsoft.com/graph/api/intune-devices-manageddevice-list)
+
+## Get-LapsBackupReport.ps1
+
+Reads every device in Microsoft Entra ID and what Entra ID records about every
+Windows LAPS backup, joins them on the Entra device ID, and returns one flat
+object per joined Windows device, saying whether Entra ID holds a backup of its
+local administrator password and whether that password is past its rotation
+date. It writes nothing to the tenant, and it never reads a password: it
+requests a scope that cannot return one, and never asks for the `credentials`
+property, which is how a password is requested.
+
+There is no remediation package beside it. Windows makes the LAPS backup
+itself, on the schedule its policy sets, so what Entra ID holds is the whole
+picture this report can give.
+
+### Prerequisites
+
+| Requirement | Detail |
+| --- | --- |
+| PowerShell | 5.1 or 7 |
+| Module | `Microsoft.Graph.Authentication` 2.0.0 or later |
+| Graph scopes | `Device.Read.All` (`Device.ReadWrite.All`, `Directory.Read.All` and `Directory.ReadWrite.All` are accepted) and `DeviceLocalCredential.ReadBasic.All` (`DeviceLocalCredential.Read.All` is accepted when already granted) |
+| Admin consent | Required for both, once per tenant, for the application you sign in with |
+| Licensing | Microsoft Entra ID Free or higher. Backing up to Entra ID needs no Intune licence |
+| Role | An Entra role that may read LAPS details: Global Reader, Security Reader, Security Administrator, Helpdesk Administrator, Cloud Device Administrator or Intune Administrator |
+
+A consented scope is not enough on its own: without one of those roles, Graph
+refuses to list the backups with HTTP 403, and the script says which roles
+would do.
+
+**Use a tenant-wide role.** A role scoped to administrative units may not be
+shown every backup, and a device outside its scope would be reported as
+`NoBackup`.
+
+### Examples
+
+```powershell
+# The joined devices Entra ID holds no local administrator password for
+.\Get-LapsBackupReport.ps1 -Status NoBackup |
+    Format-Table DeviceName, JoinType, LastSignInDateTime
+
+# Passwords past their rotation date, longest first, beside the last sign-in
+.\Get-LapsBackupReport.ps1 -Status Overdue | Sort-Object DaysOverdue -Descending |
+    Format-Table DeviceName, DaysOverdue, DaysSinceLastSignIn
+
+# How many devices are in each status
+.\Get-LapsBackupReport.ps1 | Group-Object Status -NoElement
+
+# Every joined Windows device, written to a timestamped CSV outside the repository
+.\Get-LapsBackupReport.ps1 -CsvPath C:\Reports -Verbose
+```
+
+### Status
+
+| Status | Meaning |
+| --- | --- |
+| `BackedUp` | Entra ID holds a backup, and its next rotation is still ahead. |
+| `Overdue` | Entra ID holds a backup, and the date it was due to be rotated has passed. The device has not replaced the password when its policy said it would. |
+| `NoBackup` | Entra ID holds no backup for the device. The helpdesk cannot look up a local administrator password for it. |
+
+A backup that carries no rotation date counts as `BackedUp`: it is held, and
+nothing says it is late.
+
+### What the report cannot tell
+
+- **Whether a LAPS policy reaches a device.** `NoBackup` means either that no
+  policy does, or that one does and the backup is failing. The device's own
+  LAPS event log says which.
+- **Where else a password is kept.** A hybrid joined device whose policy backs
+  up to Windows Server Active Directory is healthy and shows `NoBackup` here,
+  because Entra ID holds nothing for it. `JoinType` sets those devices apart.
+- **Why a device is overdue.** Most are switched off or away, and rotate when
+  they return. Compare `DaysOverdue` with `DaysSinceLastSignIn`: a device that
+  signed in recently and is still overdue is the one worth a look. The sign-in
+  date is approximate, as Entra ID's name for it says.
+
+### Which devices are reported
+
+Devices that Entra ID records as running Windows, and as Entra joined or hybrid
+joined. Registered devices, personal ones as a rule, cannot back up to Entra ID
+and are left out, with any device whose join type Entra ID does not name. The
+verbose stream counts the Windows devices left out, and the backups that belong
+to no device in the report.
+
+When Entra ID holds no backup for any device, the script warns and points at
+the tenant rather than the devices: LAPS is switched on for a tenant in the
+Entra device settings, and a policy then has to choose Microsoft Entra ID as
+the place to back up to.
+
+### Output
+
+`DeviceName`, `Status`, `JoinType`, `LastBackupDateTime`,
+`NextRotationDateTime`, `DaysOverdue`, `LastSignInDateTime`,
+`DaysSinceLastSignIn`, `AccountEnabled`, `OperatingSystemVersion`,
+`EntraDeviceId`, `ObjectId`.
+
+`JoinType` is `EntraJoined` or `HybridJoined`. `DaysOverdue` is whole days, and
+empty unless the status is `Overdue`. Dates are in UTC. Every row names a real
+device, so the output is tenant data: write the CSV outside this repository.
+
+### How it is tested
+
+`Get-LapsBackupReport.Tests.ps1` loads the script's functions and runs the body
+of its main block against a stand-in tenant held in memory, so no tenant or
+module is needed. It covers every status and the moment one turns into
+another, the join, the devices left out, the filter, the CSV and both
+warnings, and it fails if the script asks Graph for anything but the two lists,
+including the `credentials` property. The tests run under Windows PowerShell
+5.1 and PowerShell 7. What they cannot show is a real tenant's answers: the
+script has not yet been run against one.
+
+### Reference
+
+- [List deviceLocalCredentialInfo](https://learn.microsoft.com/graph/api/directory-list-devicelocalcredentials)
+- [deviceLocalCredentialInfo resource type](https://learn.microsoft.com/graph/api/resources/devicelocalcredentialinfo)
+- [List devices](https://learn.microsoft.com/graph/api/device-list)
+- [Windows LAPS in Microsoft Entra ID](https://learn.microsoft.com/entra/identity/devices/howto-manage-local-admin-passwords)
 
 ## Remove-StaleEntraDevice.ps1
 
